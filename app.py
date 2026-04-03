@@ -358,30 +358,6 @@ def shopify_put(domain: str, token: str, endpoint: str, payload: dict) -> dict:
     return resp.json()
 
 
-def update_variant_cost(domain, token, currency, variant, rates, results, market):
-    sku = variant["sku"]
-    inv_id = variant["inventory_item_id"]
-    supplier_cost_usd = lookup_supplier_cost_usd(sku)
-    if supplier_cost_usd is None:
-        return
-    target_cost = round(convert_from_usd(supplier_cost_usd, currency, rates), 2)
-    # Fetch current cost and check if mismatch exceeds tolerance
-    item_ids = [inv_id]
-    costs = fetch_inventory_costs(domain, token, item_ids)
-    current_cost = costs.get(inv_id)
-    if current_cost is None:
-        return
-    diff = round(current_cost - target_cost, 2)
-    pct_diff = round((diff / target_cost) * 100, 1) if target_cost else 0
-    if abs(diff) <= TOLERANCE_USD or abs(pct_diff) <= TOLERANCE_PCT:
-        return
-    try:
-        shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
-        results.append(f"✅ *{market.upper()}* `{sku}` {currency} {current_cost:.2f} → {currency} {target_cost:.2f} (was {pct_diff:+.1f}%)")
-    except Exception as e:
-        results.append(f"❌ *{market.upper()}* `{sku}` failed: {e}")
-
-
 def run_update_price(response_url: str, sku_filter: str = None, market_filter: str = None):
     try:
         stores = get_stores()
@@ -398,16 +374,38 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
             domain = cfg["domain"]
             token = cfg["token"]
             currency = cfg["currency"]
+            fx_rate = rates.get(currency, 1.0)
+            log.info(f"[{market.upper()}] Update using FX rate: 1 USD = {fx_rate} {currency}")
             variants = fetch_all_products(domain, token)
             if sku_filter:
                 matched = [v for v in variants if normalize_sku(v["sku"]) == normalize_sku(sku_filter)]
             else:
                 matched = [v for v in variants if lookup_supplier_cost_usd(v["sku"]) is not None]
+            # Batch fetch all costs upfront
+            item_ids = [v["inventory_item_id"] for v in matched if v["inventory_item_id"]]
+            costs = fetch_inventory_costs(domain, token, item_ids)
             for v in matched:
-                update_variant_cost(domain, token, currency, v, rates, results, market)
+                sku = v["sku"]
+                inv_id = v["inventory_item_id"]
+                s_cost_usd = lookup_supplier_cost_usd(sku)
+                if s_cost_usd is None:
+                    continue
+                target_cost = round(convert_from_usd(s_cost_usd, currency, rates), 2)
+                current_cost = costs.get(inv_id)
+                if current_cost is None:
+                    continue
+                diff = round(current_cost - target_cost, 2)
+                pct_diff = round((diff / target_cost) * 100, 1) if target_cost else 0
+                if abs(diff) <= TOLERANCE_USD or abs(pct_diff) <= TOLERANCE_PCT:
+                    continue
+                try:
+                    shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
+                    results.append(f"✅ *{market.upper()}* `{sku}` {currency} {current_cost:.2f} → {currency} {target_cost:.2f} (was {pct_diff:+.1f}%)")
+                except Exception as e:
+                    results.append(f"❌ *{market.upper()}* `{sku}` failed: {e}")
         if not results:
             if sku_filter:
-                requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ No updates needed for `{sku_filter}`."})
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"✅ No updates needed for `{sku_filter}` — all within tolerance."})
             else:
                 requests.post(response_url, json={"response_type": "ephemeral", "text": f"✅ All costs already match for *{market_filter.upper()}*."})
             return
