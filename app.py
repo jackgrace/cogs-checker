@@ -628,44 +628,52 @@ def parse_invoice(wb) -> dict:
     return items
 
 
+def classify_file(filename: str) -> str:
+    """Classify file as 'invoice' or 'packing' based on filename."""
+    name_upper = filename.upper()
+    if "INV" in name_upper:
+        return "invoice"
+    if "WW" in name_upper or "USA" in name_upper or "US" in name_upper:
+        return "packing"
+    return "unknown"
+
+
 def run_invoice_check(channel: str, file_urls: list):
     try:
         from openpyxl import load_workbook
         packing_totals = defaultdict(int)
         invoice_data = None
-        packing_count = 0
-        invoice_count = 0
+        packing_files = []
+        invoice_file = None
         for url, filename in file_urls:
-            log.info(f"Downloading {filename}...")
+            file_type = classify_file(filename)
+            if file_type == "invoice" and invoice_file is None:
+                invoice_file = (url, filename)
+            elif file_type == "packing":
+                packing_files.append((url, filename))
+            else:
+                log.warning(f"Could not classify file: {filename}")
+        if invoice_file is None:
+            slack_api("chat.postMessage", channel=channel, text="❌ Could not identify an invoice file (filename must contain 'INV').")
+            return
+        if not packing_files:
+            slack_api("chat.postMessage", channel=channel, text="❌ Could not identify packing list files (filenames must contain 'WW', 'USA', or 'US').")
+            return
+        # Parse invoice
+        log.info(f"Downloading invoice: {invoice_file[1]}...")
+        content = download_slack_file(invoice_file[0])
+        wb = load_workbook(io.BytesIO(content), data_only=True)
+        invoice_data = parse_invoice(wb)
+        log.info(f"Parsed invoice: {len(invoice_data)} SKUs")
+        # Parse packing lists
+        for url, filename in packing_files:
+            log.info(f"Downloading packing list: {filename}...")
             content = download_slack_file(url)
             wb = load_workbook(io.BytesIO(content), data_only=True)
-            sheet_names_lower = [s.lower() for s in wb.sheetnames]
-            # Detect if this is an invoice or packing list
-            is_invoice = False
-            for ws in wb.worksheets:
-                for row in ws.iter_rows(min_row=1, max_row=10, values_only=True):
-                    row_text = " ".join(str(c) for c in row if c).lower()
-                    if "proforma invoice" in row_text or "invoice" in row_text or "marks" in row_text.split():
-                        is_invoice = True
-                        break
-                if is_invoice:
-                    break
-            if is_invoice and invoice_data is None:
-                invoice_data = parse_invoice(wb)
-                invoice_count += 1
-                log.info(f"Parsed invoice from {filename}: {len(invoice_data)} SKUs")
-            else:
-                pl = parse_packing_list(wb)
-                for sku, qty in pl.items():
-                    packing_totals[sku] += qty
-                packing_count += 1
-                log.info(f"Parsed packing list from {filename}: {len(pl)} SKUs, {sum(pl.values())} total units")
-        if invoice_data is None:
-            slack_api("chat.postMessage", channel=channel, text="❌ Could not identify an invoice file. Please upload 2 packing lists + 1 invoice.")
-            return
-        if packing_count == 0:
-            slack_api("chat.postMessage", channel=channel, text="❌ Could not identify any packing list files. Please upload 2 packing lists + 1 invoice.")
-            return
+            pl = parse_packing_list(wb)
+            for sku, qty in pl.items():
+                packing_totals[sku] += qty
+            log.info(f"Parsed packing list {filename}: {len(pl)} SKUs, {sum(pl.values())} total units")
         # Cross-check
         all_skus = set(packing_totals.keys()) | set(invoice_data.keys())
         qty_matches = []
@@ -705,7 +713,7 @@ def run_invoice_check(channel: str, file_urls: list):
         # Build Slack message
         blocks = [
             {"type": "header", "text": {"type": "plain_text", "text": "📋 Invoice vs Packing List Check", "emoji": True}},
-            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Files:* {packing_count} packing list(s) + 1 invoice  |  *SKUs checked:* {len(all_skus)}"}]},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Files:* {len(packing_files)} packing list(s) + 1 invoice  |  *SKUs checked:* {len(all_skus)}"}]},
             {"type": "divider"},
         ]
         if qty_mismatches:
@@ -740,6 +748,10 @@ def run_invoice_check(channel: str, file_urls: list):
         slack_api("chat.postMessage", channel=channel, text=f"❌ Invoice check failed: {e}")
 
 
+_pending_files = {}  # channel_id -> {"files": [(url, name)], "timer": Timer}
+_pending_lock = threading.Lock()
+
+
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
     data = request.json
@@ -754,66 +766,46 @@ def slack_events():
         if event_id in _processed_events:
             return jsonify({"ok": True})
         _processed_events.add(event_id)
-        # Clean up old events (keep last 1000)
         if len(_processed_events) > 1000:
             _processed_events.clear()
         # Handle file_shared events
         if event.get("type") == "file_shared":
             file_id = event.get("file_id")
             channel_id = event.get("channel_id", "")
-            # Get file info
             file_info = slack_api("files.info", file=file_id)
             if not file_info.get("ok"):
                 return jsonify({"ok": True})
             f = file_info.get("file", {})
             filename = f.get("name", "")
+            url = f.get("url_private", "")
             if not filename.lower().endswith((".xlsx", ".xls")):
                 return jsonify({"ok": True})
-            # Check if there are multiple recent Excel files in the channel
-            # We need 3 files total, so wait and collect
             log.info(f"Excel file uploaded: {filename} in channel {channel_id}")
-            # Defer collection to background thread
-            thread = threading.Thread(target=collect_and_check_files, args=(channel_id,), daemon=True)
-            thread.start()
-        # Handle message events with files
-        if event.get("type") == "message" and event.get("files"):
-            channel_id = event.get("channel", "")
-            files = event.get("files", [])
-            excel_files = [(f.get("url_private"), f.get("name", "")) for f in files if f.get("name", "").lower().endswith((".xlsx", ".xls"))]
-            if len(excel_files) >= 2:
-                log.info(f"Message with {len(excel_files)} Excel files in channel {channel_id}")
-                thread = threading.Thread(target=run_invoice_check, args=(channel_id, excel_files), daemon=True)
-                thread.start()
+            # Collect files with debounce — wait 5 seconds after last upload
+            with _pending_lock:
+                if channel_id not in _pending_files:
+                    _pending_files[channel_id] = {"files": [], "timer": None}
+                _pending_files[channel_id]["files"].append((url, filename))
+                # Cancel previous timer and start new one
+                if _pending_files[channel_id]["timer"]:
+                    _pending_files[channel_id]["timer"].cancel()
+                timer = threading.Timer(5.0, process_pending_files, args=(channel_id,))
+                _pending_files[channel_id]["timer"] = timer
+                timer.start()
     return jsonify({"ok": True})
 
 
-def collect_and_check_files(channel_id: str):
-    """Wait a few seconds for all files to arrive, then check if we have enough."""
-    import time
-    time.sleep(5)  # Wait for all files to be uploaded
-    # Fetch recent messages to find Excel files
-    result = slack_api("conversations.history", channel=channel_id, limit=10)
-    if not result.get("ok"):
-        log.error(f"Could not fetch channel history: {result.get('error')}")
+def process_pending_files(channel_id: str):
+    with _pending_lock:
+        pending = _pending_files.pop(channel_id, None)
+    if not pending:
         return
-    excel_files = []
-    seen_ids = set()
-    for msg in result.get("messages", []):
-        for f in msg.get("files", []):
-            if f.get("id") in seen_ids:
-                continue
-            if f.get("name", "").lower().endswith((".xlsx", ".xls")):
-                seen_ids.add(f["id"])
-                excel_files.append((f.get("url_private"), f.get("name", "")))
-        # Only look at messages from last 2 minutes
-        ts = float(msg.get("ts", 0))
-        if datetime.utcnow().timestamp() - ts > 120:
-            break
-    if len(excel_files) >= 3:
-        log.info(f"Found {len(excel_files)} Excel files, starting invoice check")
-        run_invoice_check(channel_id, excel_files)
-    else:
-        log.info(f"Only {len(excel_files)} Excel files found, waiting for more (need 3)")
+    files = pending["files"]
+    log.info(f"Processing {len(files)} files for channel {channel_id}")
+    if len(files) < 3:
+        slack_api("chat.postMessage", channel=channel_id, text=f"⚠️ Received {len(files)} file(s) but need 3 (2 packing lists + 1 invoice).")
+        return
+    run_invoice_check(channel_id, files)
 
 
 if __name__ == "__main__":
