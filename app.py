@@ -314,14 +314,36 @@ def shopify_put(domain: str, token: str, endpoint: str, payload: dict) -> dict:
     return resp.json()
 
 
-def run_update_price(response_url: str, sku_filter: str, market_filter: str = None):
+def update_variant_cost(domain, token, currency, variant, rates, results, market):
+    sku = variant["sku"]
+    inv_id = variant["inventory_item_id"]
+    supplier_cost_usd = lookup_supplier_cost_usd(sku)
+    if supplier_cost_usd is None:
+        return
+    target_cost = round(convert_from_usd(supplier_cost_usd, currency, rates), 2)
+    # Fetch current cost to check if update needed
+    item_ids = [inv_id]
+    costs = fetch_inventory_costs(domain, token, item_ids)
+    current_cost = costs.get(inv_id)
+    if current_cost is not None and round(current_cost, 2) == target_cost:
+        return
+    try:
+        shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
+        old_str = f"{currency} {current_cost:.2f}" if current_cost is not None else "none"
+        results.append(f"✅ *{market.upper()}* `{sku}` {old_str} → {currency} {target_cost:.2f}")
+    except Exception as e:
+        results.append(f"❌ *{market.upper()}* `{sku}` failed: {e}")
+
+
+def run_update_price(response_url: str, sku_filter: str = None, market_filter: str = None):
     try:
         stores = get_stores()
         rates = fetch_fx_rates()
-        supplier_cost_usd = lookup_supplier_cost_usd(sku_filter)
-        if supplier_cost_usd is None:
-            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ SKU `{sku_filter}` not found in supplier list."})
-            return
+        if sku_filter:
+            supplier_cost_usd = lookup_supplier_cost_usd(sku_filter)
+            if supplier_cost_usd is None:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ SKU `{sku_filter}` not found in supplier list."})
+                return
         results = []
         for market, cfg in stores.items():
             if market_filter and market != market_filter.lower():
@@ -329,20 +351,21 @@ def run_update_price(response_url: str, sku_filter: str, market_filter: str = No
             domain = cfg["domain"]
             token = cfg["token"]
             currency = cfg["currency"]
-            target_cost = round(convert_from_usd(supplier_cost_usd, currency, rates), 2)
             variants = fetch_all_products(domain, token)
-            matched = [v for v in variants if normalize_sku(v["sku"]) == normalize_sku(sku_filter)]
+            if sku_filter:
+                matched = [v for v in variants if normalize_sku(v["sku"]) == normalize_sku(sku_filter)]
+            else:
+                matched = [v for v in variants if lookup_supplier_cost_usd(v["sku"]) is not None]
             for v in matched:
-                inv_id = v["inventory_item_id"]
-                try:
-                    shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
-                    results.append(f"✅ *{market.upper()}* `{v['sku']}` → {currency} {target_cost:.2f}")
-                except Exception as e:
-                    results.append(f"❌ *{market.upper()}* `{v['sku']}` failed: {e}")
+                update_variant_cost(domain, token, currency, v, rates, results, market)
         if not results:
-            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ SKU `{sku_filter}` not found in any Shopify store."})
+            if sku_filter:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ No updates needed for `{sku_filter}`."})
+            else:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"✅ All costs already match for *{market_filter.upper()}*."})
             return
-        msg = f"*Updated `{sku_filter}` (source: ${supplier_cost_usd:.2f} USD)*\n" + "\n".join(results)
+        header = f"*Updated `{sku_filter}`*" if sku_filter else f"*Updated all SKUs*"
+        msg = header + f" ({len(results)} changes)\n" + "\n".join(results)
         requests.post(response_url, json={"response_type": "in_channel", "text": msg})
     except Exception as e:
         log.error(f"Update price failed: {e}")
@@ -354,14 +377,33 @@ def slack_update_price():
     response_url = request.form.get("response_url")
     text = request.form.get("text", "").strip()
     parts = text.split()
-    if len(parts) < 1 or len(parts) > 2:
-        return jsonify({"response_type": "ephemeral", "text": "Usage: `/cogs-update SKU` or `/cogs-update SKU au`"})
-    sku = parts[0].upper()
-    market_filter = parts[1].lower() if len(parts) == 2 else None
-    thread = threading.Thread(target=run_update_price, args=(response_url, sku, market_filter), daemon=True)
-    thread.start()
-    scope = f"*{market_filter.upper()}*" if market_filter else "*all stores*"
-    return jsonify({"response_type": "ephemeral", "text": f"⏳ Updating `{sku}` cost in {scope}..."})
+    stores = get_stores()
+    markets = set(stores.keys())
+    if len(parts) == 0:
+        return jsonify({"response_type": "ephemeral", "text": "Usage:\n`/cogs-update SKU` — update SKU in all stores\n`/cogs-update SKU au` — update SKU in AU only\n`/cogs-update au` — update all SKUs in AU"})
+    if len(parts) == 1:
+        arg = parts[0].lower()
+        if arg in markets:
+            # geo only — update all SKUs for that store
+            thread = threading.Thread(target=run_update_price, args=(response_url, None, arg), daemon=True)
+            thread.start()
+            return jsonify({"response_type": "ephemeral", "text": f"⏳ Updating all SKU costs in *{arg.upper()}*... This may take a while."})
+        else:
+            # SKU only — update across all stores
+            sku = parts[0].upper()
+            thread = threading.Thread(target=run_update_price, args=(response_url, sku, None), daemon=True)
+            thread.start()
+            return jsonify({"response_type": "ephemeral", "text": f"⏳ Updating `{sku}` cost in *all stores*..."})
+    if len(parts) == 2:
+        sku = parts[0].upper()
+        market = parts[1].lower()
+        if market not in markets:
+            available = ", ".join(markets)
+            return jsonify({"response_type": "ephemeral", "text": f"❌ Unknown market `{market}`. Available: {available}"})
+        thread = threading.Thread(target=run_update_price, args=(response_url, sku, market), daemon=True)
+        thread.start()
+        return jsonify({"response_type": "ephemeral", "text": f"⏳ Updating `{sku}` cost in *{market.upper()}*..."})
+    return jsonify({"response_type": "ephemeral", "text": "Usage:\n`/cogs-update SKU` — update SKU in all stores\n`/cogs-update SKU au` — update SKU in AU only\n`/cogs-update au` — update all SKUs in AU"})
 
 
 if __name__ == "__main__":
