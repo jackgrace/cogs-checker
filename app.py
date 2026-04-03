@@ -83,17 +83,23 @@ def convert_from_usd(amount: float, to_currency: str, rates: dict) -> float:
     return round(amount * rate, 4)
 
 
+def normalize_sku(sku: str) -> str:
+    return sku.upper().strip().replace(" ", "").replace("-", "_")
+
+
 def lookup_supplier_cost_usd(sku: str) -> float | None:
-    parts = [s.strip() for s in sku.upper().split("+") if s.strip()]
+    parts = [s.strip() for s in sku.split("+") if s.strip()]
     total = 0.0
     for part in parts:
+        norm_part = normalize_sku(part)
         found = False
         for s_sku, s_data in SUPPLIER_PRICES.items():
-            if s_sku.upper() == part:
+            if normalize_sku(s_sku) == norm_part:
                 total += s_data["cost_usd"]
                 found = True
                 break
         if not found:
+            log.warning(f"SKU part '{part}' (normalized: '{norm_part}') not found in supplier list")
             return None
     return total
 
@@ -230,13 +236,21 @@ def format_slack_message(all_results: list, rates: dict) -> dict:
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*{market}* ({currency}, 1 USD = {rate:.4f} {currency})  —  {res['total_skus']} SKUs  |  {status}"}})
         if mismatches:
             lines = []
-            for m in mismatches[:15]:
+            for m in mismatches:
                 direction = "📈" if m["diff_local"] > 0 else "📉"
                 c = m["currency"]
                 lines.append(f"{direction} `{m['sku']}` — Shopify: {c} {m['shopify_cost_local']:.2f} vs Supplier: {c} {m['supplier_cost_local']:.2f} (*{m['diff_pct']:+.1f}%*)")
-            if len(mismatches) > 15:
-                lines.append(f"_...and {len(mismatches) - 15} more_")
-            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}})
+            chunk = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 2900:
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
         if res["no_cost_in_shopify"]:
             skus = [x["sku"] for x in res["no_cost_in_shopify"][:10]]
             blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"🔲 *No cost in Shopify ({len(res['no_cost_in_shopify'])}):* {', '.join(f'`{s}`' for s in skus)}{'...' if len(res['no_cost_in_shopify']) > 10 else ''}"}]})
@@ -292,28 +306,62 @@ def slack_cogs_check():
     return jsonify({"response_type": "ephemeral", "text": f"⏳ Checking COGS for {scope}... Results incoming."})
 
 
+def shopify_put(domain: str, token: str, endpoint: str, payload: dict) -> dict:
+    url = f"https://{domain}/admin/api/{SHOPIFY_API_VERSION}/{endpoint}.json"
+    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+    resp = requests.put(url, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def run_update_price(response_url: str, sku_filter: str, market_filter: str = None):
+    try:
+        stores = get_stores()
+        rates = fetch_fx_rates()
+        supplier_cost_usd = lookup_supplier_cost_usd(sku_filter)
+        if supplier_cost_usd is None:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ SKU `{sku_filter}` not found in supplier list."})
+            return
+        results = []
+        for market, cfg in stores.items():
+            if market_filter and market != market_filter.lower():
+                continue
+            domain = cfg["domain"]
+            token = cfg["token"]
+            currency = cfg["currency"]
+            target_cost = round(convert_from_usd(supplier_cost_usd, currency, rates), 2)
+            variants = fetch_all_products(domain, token)
+            matched = [v for v in variants if normalize_sku(v["sku"]) == normalize_sku(sku_filter)]
+            for v in matched:
+                inv_id = v["inventory_item_id"]
+                try:
+                    shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
+                    results.append(f"✅ *{market.upper()}* `{v['sku']}` → {currency} {target_cost:.2f}")
+                except Exception as e:
+                    results.append(f"❌ *{market.upper()}* `{v['sku']}` failed: {e}")
+        if not results:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ SKU `{sku_filter}` not found in any Shopify store."})
+            return
+        msg = f"*Updated `{sku_filter}` (source: ${supplier_cost_usd:.2f} USD)*\n" + "\n".join(results)
+        requests.post(response_url, json={"response_type": "in_channel", "text": msg})
+    except Exception as e:
+        log.error(f"Update price failed: {e}")
+        requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Update failed: {e}"})
+
+
 @app.route("/slack/update-price", methods=["POST"])
 def slack_update_price():
+    response_url = request.form.get("response_url")
     text = request.form.get("text", "").strip()
     parts = text.split()
-    if len(parts) != 2:
-        return jsonify({"response_type": "ephemeral", "text": "Usage: `/cogs-update SKU PRICE` e.g. `/cogs-update MIK_01 5.45`"})
+    if len(parts) < 1 or len(parts) > 2:
+        return jsonify({"response_type": "ephemeral", "text": "Usage: `/cogs-update SKU` or `/cogs-update SKU au`"})
     sku = parts[0].upper()
-    try:
-        new_price = float(parts[1])
-    except ValueError:
-        return jsonify({"response_type": "ephemeral", "text": "❌ Invalid price."})
-    found = False
-    for s_sku in SUPPLIER_PRICES:
-        if s_sku.upper() == sku:
-            old_price = SUPPLIER_PRICES[s_sku]["cost_usd"]
-            SUPPLIER_PRICES[s_sku]["cost_usd"] = new_price
-            found = True
-            with open(PRICE_LIST_PATH, "w") as f:
-                json.dump(SUPPLIER_DATA, f, indent=2)
-            return jsonify({"response_type": "in_channel", "text": f"✅ Updated `{sku}`: ${old_price:.2f} → ${new_price:.2f}"})
-    if not found:
-        return jsonify({"response_type": "ephemeral", "text": f"❌ SKU `{sku}` not found in supplier list."})
+    market_filter = parts[1].lower() if len(parts) == 2 else None
+    thread = threading.Thread(target=run_update_price, args=(response_url, sku, market_filter), daemon=True)
+    thread.start()
+    scope = f"*{market_filter.upper()}*" if market_filter else "*all stores*"
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Updating `{sku}` cost in {scope}..."})
 
 
 if __name__ == "__main__":
