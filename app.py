@@ -496,12 +496,22 @@ def is_non_product_row(text: str) -> bool:
 
 
 def slack_api(method: str, **kwargs):
-    resp = requests.post(
-        f"https://slack.com/api/{method}",
-        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
-        json=kwargs,
-        timeout=15,
-    )
+    # Some Slack methods need form data, others need JSON
+    form_methods = {"files.info"}
+    if method in form_methods:
+        resp = requests.post(
+            f"https://slack.com/api/{method}",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            data=kwargs,
+            timeout=15,
+        )
+    else:
+        resp = requests.post(
+            f"https://slack.com/api/{method}",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            json=kwargs,
+            timeout=15,
+        )
     data = resp.json()
     if not data.get("ok"):
         log.error(f"Slack API {method} failed: {data.get('error')}")
