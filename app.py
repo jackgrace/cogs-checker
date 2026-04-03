@@ -26,7 +26,7 @@ SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 TOLERANCE_USD = float(os.environ.get("COGS_TOLERANCE_USD", "0.10"))
 TOLERANCE_PCT = float(os.environ.get("COGS_TOLERANCE_PCT", "3.0"))
 
-_fx_cache = {"rates": {}, "fetched_at": None}
+_fx_cache = {"rates": {}, "fetched_at": None, "source": None}
 FX_CACHE_TTL = timedelta(hours=6)
 
 
@@ -55,7 +55,7 @@ def get_stores() -> dict:
 def fetch_fx_rates() -> dict:
     now = datetime.utcnow()
     if _fx_cache["fetched_at"] and (now - _fx_cache["fetched_at"]) < FX_CACHE_TTL:
-        log.info(f"Using cached FX rates (fetched {_fx_cache['fetched_at']})")
+        log.info(f"Using cached FX rates (fetched {_fx_cache['fetched_at']}, source: {_fx_cache['source']})")
         return _fx_cache["rates"]
     # Try primary API
     try:
@@ -66,6 +66,7 @@ def fetch_fx_rates() -> dict:
         rates["USD"] = 1.0
         _fx_cache["rates"] = rates
         _fx_cache["fetched_at"] = now
+        _fx_cache["source"] = "live"
         log.info(f"FX rates refreshed from frankfurter: AUD={rates.get('AUD')}, GBP={rates.get('GBP')}, CAD={rates.get('CAD')}, EUR={rates.get('EUR')}")
         return rates
     except Exception as e:
@@ -78,14 +79,17 @@ def fetch_fx_rates() -> dict:
         rates = data.get("rates", {})
         _fx_cache["rates"] = rates
         _fx_cache["fetched_at"] = now
+        _fx_cache["source"] = "live"
         log.info(f"FX rates refreshed from er-api: AUD={rates.get('AUD')}, GBP={rates.get('GBP')}, CAD={rates.get('CAD')}, EUR={rates.get('EUR')}")
         return rates
     except Exception as e:
         log.error(f"Backup FX fetch also failed: {e}")
     if _fx_cache["rates"]:
         log.warning("Using previously cached FX rates")
+        _fx_cache["source"] = "cached"
         return _fx_cache["rates"]
     log.error("No FX rates available, using hardcoded fallback")
+    _fx_cache["source"] = "fallback"
     return {"USD": 1.0, "AUD": 1.44, "GBP": 0.77, "CAD": 1.39, "EUR": 0.88}
 
 
@@ -276,9 +280,11 @@ def check_cogs_for_store(market: str, store_cfg: dict, rates: dict) -> dict:
 
 
 def format_slack_message(all_results: list, rates: dict) -> dict:
+    fx_source = _fx_cache.get("source", "unknown")
+    fx_label = "🟢 Live FX rates" if fx_source == "live" else "🟡 Cached FX rates" if fx_source == "cached" else "🔴 Fallback FX rates (API unavailable)"
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "📦 COGS Check Report", "emoji": True}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Source:* {SUPPLIER_DATA['source']}  |  *Invoice Date:* {SUPPLIER_DATA['date']}  |  *Tolerance:* ${TOLERANCE_USD} / {TOLERANCE_PCT}%"}]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Source:* {SUPPLIER_DATA['source']}  |  *Invoice Date:* {SUPPLIER_DATA['date']}  |  *Tolerance:* ${TOLERANCE_USD} / {TOLERANCE_PCT}%  |  {fx_label}"}]},
         {"type": "divider"},
     ]
     total_mismatches = 0
