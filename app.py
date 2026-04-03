@@ -365,16 +365,19 @@ def update_variant_cost(domain, token, currency, variant, rates, results, market
     if supplier_cost_usd is None:
         return
     target_cost = round(convert_from_usd(supplier_cost_usd, currency, rates), 2)
-    # Fetch current cost to check if update needed
+    # Fetch current cost and check if mismatch exceeds tolerance
     item_ids = [inv_id]
     costs = fetch_inventory_costs(domain, token, item_ids)
     current_cost = costs.get(inv_id)
-    if current_cost is not None and round(current_cost, 2) == target_cost:
+    if current_cost is None:
+        return
+    diff = round(current_cost - target_cost, 2)
+    pct_diff = round((diff / target_cost) * 100, 1) if target_cost else 0
+    if abs(diff) <= TOLERANCE_USD or abs(pct_diff) <= TOLERANCE_PCT:
         return
     try:
         shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
-        old_str = f"{currency} {current_cost:.2f}" if current_cost is not None else "none"
-        results.append(f"✅ *{market.upper()}* `{sku}` {old_str} → {currency} {target_cost:.2f}")
+        results.append(f"✅ *{market.upper()}* `{sku}` {currency} {current_cost:.2f} → {currency} {target_cost:.2f} (was {pct_diff:+.1f}%)")
     except Exception as e:
         results.append(f"❌ *{market.upper()}* `{sku}` failed: {e}")
 
