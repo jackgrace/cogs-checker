@@ -180,7 +180,7 @@ def check_cogs_for_store(market: str, store_cfg: dict, rates: dict) -> dict:
         inv_id = v["inventory_item_id"]
         shopify_cost_local = costs.get(inv_id)
         supplier_cost_usd = lookup_supplier_cost_usd(sku)
-        if shopify_cost_local is None or shopify_cost_local == 0:
+        if shopify_cost_local is None:
             results["no_cost_in_shopify"].append({
                 "sku": sku,
                 "product": v["product_title"],
