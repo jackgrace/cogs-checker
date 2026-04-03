@@ -147,13 +147,16 @@ def fetch_inventory_costs(domain: str, token: str, item_ids: list) -> dict:
     for i in range(0, len(item_ids), 100):
         batch = item_ids[i:i+100]
         ids_str = ",".join(str(x) for x in batch)
-        data = shopify_get(domain, token, "inventory_items", {"ids": ids_str})
-        for item in data.get("inventory_items", []):
-            cost = item.get("cost")
-            if cost is not None:
-                costs[item["id"]] = float(cost)
-            else:
-                costs[item["id"]] = None
+        try:
+            data = shopify_get(domain, token, "inventory_items", {"ids": ids_str})
+            for item in data.get("inventory_items", []):
+                cost = item.get("cost")
+                if cost is not None:
+                    costs[item["id"]] = float(cost)
+                else:
+                    costs[item["id"]] = None
+        except Exception as e:
+            log.error(f"Failed to fetch inventory batch starting at {i}: {e}")
     return costs
 
 
@@ -165,7 +168,13 @@ def check_cogs_for_store(market: str, store_cfg: dict, rates: dict) -> dict:
     variants = fetch_all_products(domain, token)
     log.info(f"[{market.upper()}] Found {len(variants)} variants with SKUs")
     item_ids = [v["inventory_item_id"] for v in variants if v["inventory_item_id"]]
+    no_inv_id = [v["sku"] for v in variants if not v["inventory_item_id"]]
+    if no_inv_id:
+        log.warning(f"[{market.upper()}] {len(no_inv_id)} variants have no inventory_item_id: {no_inv_id[:10]}")
     costs = fetch_inventory_costs(domain, token, item_ids)
+    null_cost_skus = [v["sku"] for v in variants if v["inventory_item_id"] and costs.get(v["inventory_item_id"]) is None]
+    if null_cost_skus:
+        log.warning(f"[{market.upper()}] {len(null_cost_skus)} variants have null cost from API: {null_cost_skus[:20]}")
     results = {
         "market": market.upper(),
         "currency": currency,
