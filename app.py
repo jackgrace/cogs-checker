@@ -743,9 +743,12 @@ def run_invoice_check(channel: str, file_urls: list):
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"📄 *In invoice but not in packing list:*\n{', '.join(only_in_invoice)}"}})
         blocks.append({"type": "divider"})
         # Calculate cost breakdown
-        overshipment_cost = sum(m["cost_impact"] for m in qty_mismatches if m["cost_impact"] > 0)
-        undershipment_cost = sum(m["cost_impact"] for m in qty_mismatches if m["cost_impact"] < 0)
-        invoice_only_cost = sum(inv["line_total"] for sku, inv in invoice_data.items() if sku not in packing_totals and inv["qty"] > 0)
+        overshipments = sorted([m for m in qty_mismatches if m["cost_impact"] > 0], key=lambda x: x["cost_impact"], reverse=True)
+        undershipments = sorted([m for m in qty_mismatches if m["cost_impact"] < 0], key=lambda x: x["cost_impact"])
+        overshipment_cost = sum(m["cost_impact"] for m in overshipments)
+        undershipment_cost = sum(m["cost_impact"] for m in undershipments)
+        invoice_only_items = [(sku, inv) for sku, inv in invoice_data.items() if sku not in packing_totals and inv["qty"] > 0]
+        invoice_only_cost = sum(inv["line_total"] for _, inv in invoice_only_items)
         cost_diff = round(total_expected_cost - total_invoice_cost, 2)
         cost_status = "✅" if abs(cost_diff) < 0.50 else "⚠️"
         summary_lines = [
@@ -753,16 +756,23 @@ def run_invoice_check(channel: str, file_urls: list):
             f"• Invoice product total: *${total_invoice_cost:,.2f}*",
             f"• Expected cost from packing list: *${total_expected_cost:,.2f}*",
             f"• Difference: {cost_status} *${cost_diff:+,.2f}*",
-            f"",
-            f"*Breakdown:*",
         ]
-        if overshipment_cost:
-            summary_lines.append(f"• 📈 Shipped more than invoiced: *${overshipment_cost:+,.2f}* (you received extra)")
-        if undershipment_cost:
-            summary_lines.append(f"• 📉 Invoiced more than shipped: *${undershipment_cost:,.2f}* (you're being overcharged)")
-        if invoice_only_cost:
-            summary_lines.append(f"• 📄 Invoiced but not in packing list: *${invoice_only_cost:,.2f}*")
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(summary_lines)}})
+        if undershipments:
+            lines = [f"📉 *Overcharged — invoiced more than shipped (${abs(undershipment_cost):,.2f}):*"]
+            for m in undershipments:
+                lines.append(f"• `{m['sku']}` — shipped *{m['packing_qty']}* but invoiced *{m['invoice_qty']}* ({m['diff']:+d} units = *${m['cost_impact']:+.2f}*)")
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}})
+        if invoice_only_items:
+            lines = [f"📄 *Invoiced but nothing shipped (${invoice_only_cost:,.2f}):*"]
+            for sku, inv in invoice_only_items:
+                lines.append(f"• `{inv['sku_raw']}` — *{inv['qty']}* units × ${inv['unit_price']:.2f} = *${inv['line_total']:.2f}*")
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}})
+        if overshipments:
+            lines = [f"📈 *Extra received — shipped more than invoiced (${overshipment_cost:,.2f}):*"]
+            for m in overshipments:
+                lines.append(f"• `{m['sku']}` — shipped *{m['packing_qty']}* but invoiced *{m['invoice_qty']}* ({m['diff']:+d} units = *${m['cost_impact']:+.2f}*)")
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}})
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"✅ {len(qty_matches)} SKUs matched  |  ⚠️ {len(qty_mismatches)} mismatches  |  📦 {len(only_in_packing)} only in packing  |  📄 {len(only_in_invoice)} only in invoice"}]})
         slack_api("chat.postMessage", channel=channel, blocks=blocks, text="Invoice vs Packing List Check")
     except Exception as e:
