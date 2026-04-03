@@ -199,10 +199,11 @@ def check_cogs_for_store(market: str, store_cfg: dict, rates: dict) -> dict:
     null_cost_skus = [v["sku"] for v in variants if v["inventory_item_id"] and costs.get(v["inventory_item_id"]) is None]
     if null_cost_skus:
         log.warning(f"[{market.upper()}] {len(null_cost_skus)} variants have null cost from API: {null_cost_skus[:20]}")
+    accessible_count = sum(1 for v in variants if v["inventory_item_id"] in costs)
     results = {
         "market": market.upper(),
         "currency": currency,
-        "total_skus": len(variants),
+        "total_skus": accessible_count,
         "matches": [],
         "mismatches": [],
         "missing_from_supplier": [],
@@ -211,6 +212,9 @@ def check_cogs_for_store(market: str, store_cfg: dict, rates: dict) -> dict:
     for v in variants:
         sku = v["sku"]
         inv_id = v["inventory_item_id"]
+        if inv_id not in costs:
+            # Item not returned by API — likely managed by a bundle/subscription app
+            continue
         shopify_cost_local = costs.get(inv_id)
         supplier_cost_usd = lookup_supplier_cost_usd(sku)
         if shopify_cost_local is None:
