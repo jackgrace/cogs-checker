@@ -473,6 +473,339 @@ def slack_update_price():
     return jsonify({"response_type": "ephemeral", "text": "Usage:\n`/cogs-update SKU` — update SKU in all stores\n`/cogs-update SKU au` — update SKU in AU only\n`/cogs-update au` — update all SKUs in AU"})
 
 
+import re
+import io
+from collections import defaultdict
+
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+INVOICE_CHANNEL = os.environ.get("INVOICE_CHANNEL", "cogs-checker")
+
+# Track processed events to avoid duplicates
+_processed_events = set()
+
+NON_PRODUCT_KEYWORDS = [
+    "package parcel", "parcels assemble", "assemble cost",
+    "shipping cost", "charge the shipping", "customs clearance",
+    "exchange rate", "total",
+]
+
+
+def is_non_product_row(text: str) -> bool:
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in NON_PRODUCT_KEYWORDS)
+
+
+def slack_api(method: str, **kwargs):
+    resp = requests.post(
+        f"https://slack.com/api/{method}",
+        headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+        json=kwargs,
+        timeout=15,
+    )
+    data = resp.json()
+    if not data.get("ok"):
+        log.error(f"Slack API {method} failed: {data.get('error')}")
+    return data
+
+
+def download_slack_file(url: str) -> bytes:
+    resp = requests.get(url, headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}, timeout=30)
+    resp.raise_for_status()
+    return resp.content
+
+
+def parse_packing_list(wb) -> dict:
+    """Parse packing list Excel. Returns {normalized_sku: total_qty}."""
+    totals = defaultdict(int)
+    for sheet in wb.sheetnames:
+        ws = wb[sheet]
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            # Find the attention/contents column (usually column 5 or 7, look for SKU patterns)
+            for cell in row:
+                if cell is None:
+                    continue
+                cell_str = str(cell).strip()
+                if not cell_str:
+                    continue
+                # Match patterns like NFS1*1, MIK_01 * 3, PEP_01*3
+                matches = re.findall(r'([A-Za-z0-9_\-]+)\s*\*\s*(\d+)', cell_str)
+                if matches:
+                    for sku, qty in matches:
+                        norm = normalize_sku(sku)
+                        totals[norm] += int(qty)
+    return dict(totals)
+
+
+def parse_invoice(wb) -> dict:
+    """Parse invoice Excel. Returns {normalized_sku: {qty, unit_price, line_total, name}}."""
+    items = {}
+    for sheet in wb.sheetnames:
+        ws = wb[sheet]
+        header_row = None
+        sku_col = None
+        qty_col = None
+        price_col = None
+        name_col = None
+        cost_col = None
+        # Find header row
+        for i, row in enumerate(ws.iter_rows(min_row=1, values_only=True), 1):
+            row_strs = [str(c).strip().upper() if c else "" for c in row]
+            for j, val in enumerate(row_strs):
+                if val in ("MARKS", "SKU"):
+                    sku_col = j
+                if "QTY" in val:
+                    qty_col = j
+                if "UNIT" in val and "PRICE" in val and "RMB" not in val:
+                    price_col = j
+                if "COMMODITY" in val or "SPECIFICATION" in val:
+                    name_col = j
+                if val == "ITEM COST (USD)" or (val.startswith("ITEM COST") and "USD" in val):
+                    cost_col = j
+            if sku_col is not None and qty_col is not None:
+                header_row = i
+                break
+        if header_row is None:
+            continue
+        for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
+            cells = list(row)
+            if sku_col >= len(cells):
+                continue
+            sku_raw = cells[sku_col]
+            if sku_raw is None:
+                continue
+            sku_str = str(sku_raw).strip()
+            if not sku_str or not re.match(r'^[A-Za-z]', sku_str):
+                # Check if this is a non-product row
+                row_text = " ".join(str(c) for c in cells if c)
+                if is_non_product_row(row_text):
+                    continue
+                continue
+            # Skip non-product rows even if they have a SKU-like value
+            row_text = " ".join(str(c) for c in cells if c)
+            if is_non_product_row(row_text):
+                continue
+            norm = normalize_sku(sku_str)
+            qty = 0
+            if qty_col is not None and qty_col < len(cells) and cells[qty_col] is not None:
+                try:
+                    qty = int(float(str(cells[qty_col]).replace(",", "")))
+                except (ValueError, TypeError):
+                    pass
+            unit_price = 0.0
+            if price_col is not None and price_col < len(cells) and cells[price_col] is not None:
+                try:
+                    price_str = str(cells[price_col]).replace("US$", "").replace("$", "").replace(",", "").strip()
+                    unit_price = float(price_str)
+                except (ValueError, TypeError):
+                    pass
+            line_total = 0.0
+            if cost_col is not None and cost_col < len(cells) and cells[cost_col] is not None:
+                try:
+                    cost_str = str(cells[cost_col]).replace("US$", "").replace("$", "").replace(",", "").strip()
+                    line_total = float(cost_str)
+                except (ValueError, TypeError):
+                    pass
+            name = ""
+            if name_col is not None and name_col < len(cells) and cells[name_col] is not None:
+                name = str(cells[name_col]).strip()
+            items[norm] = {
+                "sku_raw": sku_str,
+                "name": name,
+                "qty": qty,
+                "unit_price": unit_price,
+                "line_total": line_total,
+            }
+    return items
+
+
+def run_invoice_check(channel: str, file_urls: list):
+    try:
+        from openpyxl import load_workbook
+        packing_totals = defaultdict(int)
+        invoice_data = None
+        packing_count = 0
+        invoice_count = 0
+        for url, filename in file_urls:
+            log.info(f"Downloading {filename}...")
+            content = download_slack_file(url)
+            wb = load_workbook(io.BytesIO(content), data_only=True)
+            sheet_names_lower = [s.lower() for s in wb.sheetnames]
+            # Detect if this is an invoice or packing list
+            is_invoice = False
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(min_row=1, max_row=10, values_only=True):
+                    row_text = " ".join(str(c) for c in row if c).lower()
+                    if "proforma invoice" in row_text or "invoice" in row_text or "marks" in row_text.split():
+                        is_invoice = True
+                        break
+                if is_invoice:
+                    break
+            if is_invoice and invoice_data is None:
+                invoice_data = parse_invoice(wb)
+                invoice_count += 1
+                log.info(f"Parsed invoice from {filename}: {len(invoice_data)} SKUs")
+            else:
+                pl = parse_packing_list(wb)
+                for sku, qty in pl.items():
+                    packing_totals[sku] += qty
+                packing_count += 1
+                log.info(f"Parsed packing list from {filename}: {len(pl)} SKUs, {sum(pl.values())} total units")
+        if invoice_data is None:
+            slack_api("chat.postMessage", channel=channel, text="❌ Could not identify an invoice file. Please upload 2 packing lists + 1 invoice.")
+            return
+        if packing_count == 0:
+            slack_api("chat.postMessage", channel=channel, text="❌ Could not identify any packing list files. Please upload 2 packing lists + 1 invoice.")
+            return
+        # Cross-check
+        all_skus = set(packing_totals.keys()) | set(invoice_data.keys())
+        qty_matches = []
+        qty_mismatches = []
+        only_in_packing = []
+        only_in_invoice = []
+        total_expected_cost = 0.0
+        total_invoice_cost = 0.0
+        for sku in sorted(all_skus):
+            pl_qty = packing_totals.get(sku, 0)
+            inv = invoice_data.get(sku)
+            inv_qty = inv["qty"] if inv else 0
+            inv_price = inv["unit_price"] if inv else 0
+            inv_line = inv["line_total"] if inv else 0
+            sku_label = inv["sku_raw"] if inv else sku
+            if inv:
+                total_invoice_cost += inv_line
+                expected_line = round(pl_qty * inv_price, 2)
+                total_expected_cost += expected_line
+            if sku in packing_totals and sku not in invoice_data:
+                only_in_packing.append(f"`{sku}` ({pl_qty} units)")
+                continue
+            if sku not in packing_totals and sku in invoice_data:
+                if inv_qty > 0:
+                    only_in_invoice.append(f"`{sku_label}` ({inv_qty} units, ${inv_line:.2f})")
+                continue
+            if pl_qty == inv_qty:
+                qty_matches.append(sku_label)
+            else:
+                qty_mismatches.append({
+                    "sku": sku_label,
+                    "packing_qty": pl_qty,
+                    "invoice_qty": inv_qty,
+                    "diff": pl_qty - inv_qty,
+                    "cost_impact": round((pl_qty - inv_qty) * inv_price, 2),
+                })
+        # Build Slack message
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": "📋 Invoice vs Packing List Check", "emoji": True}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Files:* {packing_count} packing list(s) + 1 invoice  |  *SKUs checked:* {len(all_skus)}"}]},
+            {"type": "divider"},
+        ]
+        if qty_mismatches:
+            lines = [f"⚠️ *Quantity Mismatches ({len(qty_mismatches)}):*"]
+            for m in qty_mismatches:
+                lines.append(f"• `{m['sku']}` — Packing: *{m['packing_qty']}* vs Invoice: *{m['invoice_qty']}* (diff: {m['diff']:+d}, ${m['cost_impact']:+.2f})")
+            chunk = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 2900:
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+        else:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "✅ *All quantities match between packing list and invoice*"}})
+        if only_in_packing:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"📦 *In packing list but not in invoice:*\n{', '.join(only_in_packing)}"}})
+        if only_in_invoice:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"📄 *In invoice but not in packing list:*\n{', '.join(only_in_invoice)}"}})
+        blocks.append({"type": "divider"})
+        cost_diff = round(total_expected_cost - total_invoice_cost, 2)
+        cost_status = "✅" if abs(cost_diff) < 0.50 else "⚠️"
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Cost Summary:*\n• Invoice product total: *${total_invoice_cost:,.2f}*\n• Expected from packing list: *${total_expected_cost:,.2f}*\n• Difference: {cost_status} *${cost_diff:+,.2f}*"}})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"✅ {len(qty_matches)} SKUs matched  |  ⚠️ {len(qty_mismatches)} mismatches  |  📦 {len(only_in_packing)} only in packing  |  📄 {len(only_in_invoice)} only in invoice"}]})
+        slack_api("chat.postMessage", channel=channel, blocks=blocks, text="Invoice vs Packing List Check")
+    except Exception as e:
+        log.error(f"Invoice check failed: {e}", exc_info=True)
+        slack_api("chat.postMessage", channel=channel, text=f"❌ Invoice check failed: {e}")
+
+
+@app.route("/slack/events", methods=["POST"])
+def slack_events():
+    data = request.json
+    # URL verification challenge
+    if data.get("type") == "url_verification":
+        return jsonify({"challenge": data["challenge"]})
+    # Event callback
+    if data.get("type") == "event_callback":
+        event = data.get("event", {})
+        event_id = data.get("event_id", "")
+        # Deduplicate
+        if event_id in _processed_events:
+            return jsonify({"ok": True})
+        _processed_events.add(event_id)
+        # Clean up old events (keep last 1000)
+        if len(_processed_events) > 1000:
+            _processed_events.clear()
+        # Handle file_shared events
+        if event.get("type") == "file_shared":
+            file_id = event.get("file_id")
+            channel_id = event.get("channel_id", "")
+            # Get file info
+            file_info = slack_api("files.info", file=file_id)
+            if not file_info.get("ok"):
+                return jsonify({"ok": True})
+            f = file_info.get("file", {})
+            filename = f.get("name", "")
+            if not filename.lower().endswith((".xlsx", ".xls")):
+                return jsonify({"ok": True})
+            # Check if there are multiple recent Excel files in the channel
+            # We need 3 files total, so wait and collect
+            log.info(f"Excel file uploaded: {filename} in channel {channel_id}")
+            # Defer collection to background thread
+            thread = threading.Thread(target=collect_and_check_files, args=(channel_id,), daemon=True)
+            thread.start()
+        # Handle message events with files
+        if event.get("type") == "message" and event.get("files"):
+            channel_id = event.get("channel", "")
+            files = event.get("files", [])
+            excel_files = [(f.get("url_private"), f.get("name", "")) for f in files if f.get("name", "").lower().endswith((".xlsx", ".xls"))]
+            if len(excel_files) >= 2:
+                log.info(f"Message with {len(excel_files)} Excel files in channel {channel_id}")
+                thread = threading.Thread(target=run_invoice_check, args=(channel_id, excel_files), daemon=True)
+                thread.start()
+    return jsonify({"ok": True})
+
+
+def collect_and_check_files(channel_id: str):
+    """Wait a few seconds for all files to arrive, then check if we have enough."""
+    import time
+    time.sleep(5)  # Wait for all files to be uploaded
+    # Fetch recent messages to find Excel files
+    result = slack_api("conversations.history", channel=channel_id, limit=10)
+    if not result.get("ok"):
+        log.error(f"Could not fetch channel history: {result.get('error')}")
+        return
+    excel_files = []
+    seen_ids = set()
+    for msg in result.get("messages", []):
+        for f in msg.get("files", []):
+            if f.get("id") in seen_ids:
+                continue
+            if f.get("name", "").lower().endswith((".xlsx", ".xls")):
+                seen_ids.add(f["id"])
+                excel_files.append((f.get("url_private"), f.get("name", "")))
+        # Only look at messages from last 2 minutes
+        ts = float(msg.get("ts", 0))
+        if datetime.utcnow().timestamp() - ts > 120:
+            break
+    if len(excel_files) >= 3:
+        log.info(f"Found {len(excel_files)} Excel files, starting invoice check")
+        run_invoice_check(channel_id, excel_files)
+    else:
+        log.info(f"Only {len(excel_files)} Excel files found, waiting for more (need 3)")
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
     log.info(f"Starting COGS Checker on port {port}")
