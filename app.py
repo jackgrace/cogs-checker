@@ -31,12 +31,11 @@ FX_CACHE_TTL = timedelta(hours=6)
 
 
 STORE_CONFIG = {
-    "au": {"domain": "luxskin-au.myshopify.com", "currency": "AUD", "token_env": "SHOPIFY_TOKEN_AU"},
-    "uk": {"domain": "luxskin-uk.myshopify.com", "currency": "GBP", "token_env": "SHOPIFY_TOKEN_UK"},
-    "us": {"domain": "luxskin-us.myshopify.com", "currency": "USD", "token_env": "SHOPIFY_TOKEN_US"},
-    "ca": {"domain": "luxskin-ca.myshopify.com", "currency": "CAD", "token_env": "SHOPIFY_TOKEN_CA"},
-    "eu": {"domain": "luxskin-eu.myshopify.com", "currency": "EUR", "token_env": "SHOPIFY_TOKEN_EU"},
-    "uae": {"domain": "luxskin-uae.myshopify.com", "currency": "AED", "token_env": "SHOPIFY_TOKEN_UAE"},
+    "au": {"domain": "us-domainholdings.myshopify.com", "currency": "AUD", "token_env": "SHOPIFY_TOKEN_AU"},
+    "uk": {"domain": "uk-domainholdings.myshopify.com", "currency": "GBP", "token_env": "SHOPIFY_TOKEN_UK"},
+    "us": {"domain": "domainholdings.myshopify.com", "currency": "USD", "token_env": "SHOPIFY_TOKEN_US"},
+    "ca": {"domain": "lux-iplpro.myshopify.com", "currency": "CAD", "token_env": "SHOPIFY_TOKEN_CA"},
+    "eu": {"domain": "lux-skin-europe.myshopify.com", "currency": "EUR", "token_env": "SHOPIFY_TOKEN_EU"},
 }
 
 
