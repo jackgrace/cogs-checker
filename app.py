@@ -55,7 +55,9 @@ def get_stores() -> dict:
 def fetch_fx_rates() -> dict:
     now = datetime.utcnow()
     if _fx_cache["fetched_at"] and (now - _fx_cache["fetched_at"]) < FX_CACHE_TTL:
+        log.info(f"Using cached FX rates (fetched {_fx_cache['fetched_at']})")
         return _fx_cache["rates"]
+    # Try primary API
     try:
         resp = requests.get("https://api.frankfurter.app/latest?from=USD", timeout=10)
         resp.raise_for_status()
@@ -64,13 +66,27 @@ def fetch_fx_rates() -> dict:
         rates["USD"] = 1.0
         _fx_cache["rates"] = rates
         _fx_cache["fetched_at"] = now
-        log.info(f"FX rates refreshed: {len(rates)} currencies")
+        log.info(f"FX rates refreshed from frankfurter: AUD={rates.get('AUD')}, GBP={rates.get('GBP')}, CAD={rates.get('CAD')}, EUR={rates.get('EUR')}")
         return rates
     except Exception as e:
-        log.error(f"FX rate fetch failed: {e}")
-        if _fx_cache["rates"]:
-            return _fx_cache["rates"]
-        return {"USD": 1.0, "AUD": 1.55, "GBP": 0.79, "CAD": 1.37, "EUR": 0.92, "AED": 3.67}
+        log.error(f"Frankfurter FX fetch failed: {e}")
+    # Try backup API
+    try:
+        resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        rates = data.get("rates", {})
+        _fx_cache["rates"] = rates
+        _fx_cache["fetched_at"] = now
+        log.info(f"FX rates refreshed from er-api: AUD={rates.get('AUD')}, GBP={rates.get('GBP')}, CAD={rates.get('CAD')}, EUR={rates.get('EUR')}")
+        return rates
+    except Exception as e:
+        log.error(f"Backup FX fetch also failed: {e}")
+    if _fx_cache["rates"]:
+        log.warning("Using previously cached FX rates")
+        return _fx_cache["rates"]
+    log.error("No FX rates available, using hardcoded fallback")
+    return {"USD": 1.0, "AUD": 1.44, "GBP": 0.77, "CAD": 1.39, "EUR": 0.88}
 
 
 def convert_from_usd(amount: float, to_currency: str, rates: dict) -> float:
