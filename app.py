@@ -84,18 +84,34 @@ def convert_from_usd(amount: float, to_currency: str, rates: dict) -> float:
 
 
 def normalize_sku(sku: str) -> str:
-    return sku.upper().strip().replace(" ", "").replace("-", "_")
+    return sku.upper().strip().replace(" ", "").replace("-", "").replace("_", "")
+
+
+def parse_sku_part(part: str):
+    """Parse a SKU part, handling =QTYn suffix. Returns (base_sku, quantity)."""
+    part = part.strip()
+    if "=" in part:
+        base, suffix = part.rsplit("=", 1)
+        suffix_upper = suffix.upper()
+        if suffix_upper.startswith("QTY"):
+            try:
+                qty = int(suffix_upper[3:])
+                return base, qty
+            except ValueError:
+                pass
+    return part, 1
 
 
 def lookup_supplier_cost_usd(sku: str) -> float | None:
     parts = [s.strip() for s in sku.split("+") if s.strip()]
     total = 0.0
     for part in parts:
-        norm_part = normalize_sku(part)
+        base, qty = parse_sku_part(part)
+        norm_part = normalize_sku(base)
         found = False
         for s_sku, s_data in SUPPLIER_PRICES.items():
             if normalize_sku(s_sku) == norm_part:
-                total += s_data["cost_usd"]
+                total += s_data["cost_usd"] * qty
                 found = True
                 break
         if not found:
