@@ -22,7 +22,6 @@ with open(PRICE_LIST_PATH) as f:
     SUPPLIER_DATA = json.load(f)
 SUPPLIER_PRICES = SUPPLIER_DATA["prices"]
 
-SLACK_SIGNING_SECRET = os.environ.get("SLACK_SIGNING_SECRET", "")
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
 TOLERANCE_USD = float(os.environ.get("COGS_TOLERANCE_USD", "0.10"))
 TOLERANCE_PCT = float(os.environ.get("COGS_TOLERANCE_PCT", "3.0"))
@@ -31,25 +30,25 @@ _fx_cache = {"rates": {}, "fetched_at": None}
 FX_CACHE_TTL = timedelta(hours=6)
 
 
+STORE_CONFIG = {
+    "au": {"domain": "luxskin-au.myshopify.com", "currency": "AUD", "token_env": "SHOPIFY_TOKEN_AU"},
+    "uk": {"domain": "luxskin-uk.myshopify.com", "currency": "GBP", "token_env": "SHOPIFY_TOKEN_UK"},
+    "us": {"domain": "luxskin-us.myshopify.com", "currency": "USD", "token_env": "SHOPIFY_TOKEN_US"},
+    "ca": {"domain": "luxskin-ca.myshopify.com", "currency": "CAD", "token_env": "SHOPIFY_TOKEN_CA"},
+    "eu": {"domain": "luxskin-eu.myshopify.com", "currency": "EUR", "token_env": "SHOPIFY_TOKEN_EU"},
+    "uae": {"domain": "luxskin-uae.myshopify.com", "currency": "AED", "token_env": "SHOPIFY_TOKEN_UAE"},
+}
+
+
 def get_stores() -> dict:
-    stores_raw = os.environ.get("SHOPIFY_STORES", "")
-    currencies_raw = os.environ.get("SHOPIFY_CURRENCIES", "au:AUD,uk:GBP,us:USD,ca:CAD,eu:EUR,uae:AED")
-    currencies = {}
-    for pair in currencies_raw.split(","):
-        parts = pair.strip().split(":")
-        if len(parts) == 2:
-            currencies[parts[0].strip().lower()] = parts[1].strip().upper()
     stores = {}
-    for entry in stores_raw.split(","):
-        parts = entry.strip().split(":")
-        if len(parts) >= 3:
-            market = parts[0].strip().lower()
-            domain = parts[1].strip()
-            token = ":".join(parts[2:]).strip()
+    for market, cfg in STORE_CONFIG.items():
+        token = os.environ.get(cfg["token_env"], "")
+        if token:
             stores[market] = {
-                "domain": domain,
+                "domain": cfg["domain"],
                 "token": token,
-                "currency": currencies.get(market, "USD"),
+                "currency": cfg["currency"],
             }
     return stores
 
