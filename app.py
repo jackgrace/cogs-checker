@@ -73,14 +73,29 @@ def fetch_fx_rates() -> dict:
         return {"USD": 1.0, "AUD": 1.55, "GBP": 0.79, "CAD": 1.37, "EUR": 0.92, "AED": 3.67}
 
 
-def convert_to_usd(amount: float, from_currency: str, rates: dict) -> float:
-    if from_currency == "USD":
+def convert_from_usd(amount: float, to_currency: str, rates: dict) -> float:
+    if to_currency == "USD":
         return amount
-    rate = rates.get(from_currency)
+    rate = rates.get(to_currency)
     if rate is None or rate == 0:
-        log.warning(f"No FX rate for {from_currency}, treating as 1:1")
+        log.warning(f"No FX rate for {to_currency}, treating as 1:1")
         return amount
-    return round(amount / rate, 4)
+    return round(amount * rate, 4)
+
+
+def lookup_supplier_cost_usd(sku: str) -> float | None:
+    parts = [s.strip() for s in sku.upper().split("+") if s.strip()]
+    total = 0.0
+    for part in parts:
+        found = False
+        for s_sku, s_data in SUPPLIER_PRICES.items():
+            if s_sku.upper() == part:
+                total += s_data["cost_usd"]
+                found = True
+                break
+        if not found:
+            return None
+    return total
 
 
 def shopify_get(domain: str, token: str, endpoint: str, params: dict = None) -> dict:
@@ -156,47 +171,41 @@ def check_cogs_for_store(market: str, store_cfg: dict, rates: dict) -> dict:
     }
     for v in variants:
         sku = v["sku"]
-        sku_upper = sku.upper().strip()
         inv_id = v["inventory_item_id"]
         shopify_cost_local = costs.get(inv_id)
-        supplier_entry = None
-        for s_sku, s_data in SUPPLIER_PRICES.items():
-            if s_sku.upper() == sku_upper:
-                supplier_entry = (s_sku, s_data)
-                break
+        supplier_cost_usd = lookup_supplier_cost_usd(sku)
         if shopify_cost_local is None or shopify_cost_local == 0:
             results["no_cost_in_shopify"].append({
                 "sku": sku,
                 "product": v["product_title"],
-                "supplier_cost_usd": supplier_entry[1]["cost_usd"] if supplier_entry else None,
+                "supplier_cost_usd": supplier_cost_usd,
             })
             continue
-        if supplier_entry is None:
+        if supplier_cost_usd is None:
             results["missing_from_supplier"].append({
                 "sku": sku,
                 "product": v["product_title"],
                 "shopify_cost_local": shopify_cost_local,
-                "shopify_cost_usd": convert_to_usd(shopify_cost_local, currency, rates),
             })
             continue
-        supplier_cost_usd = supplier_entry[1]["cost_usd"]
-        shopify_cost_usd = convert_to_usd(shopify_cost_local, currency, rates)
-        diff = round(shopify_cost_usd - supplier_cost_usd, 2)
-        pct_diff = round((diff / supplier_cost_usd) * 100, 1) if supplier_cost_usd else 0
+        supplier_cost_local = convert_from_usd(supplier_cost_usd, currency, rates)
+        diff = round(shopify_cost_local - supplier_cost_local, 2)
+        pct_diff = round((diff / supplier_cost_local) * 100, 1) if supplier_cost_local else 0
         entry = {
             "sku": sku,
             "product": v["product_title"],
             "supplier_cost_usd": supplier_cost_usd,
+            "supplier_cost_local": supplier_cost_local,
             "shopify_cost_local": shopify_cost_local,
-            "shopify_cost_usd": shopify_cost_usd,
-            "diff_usd": diff,
+            "diff_local": diff,
             "diff_pct": pct_diff,
+            "currency": currency,
         }
         if abs(diff) <= TOLERANCE_USD or abs(pct_diff) <= TOLERANCE_PCT:
             results["matches"].append(entry)
         else:
             results["mismatches"].append(entry)
-    results["mismatches"].sort(key=lambda x: abs(x["diff_usd"]), reverse=True)
+    results["mismatches"].sort(key=lambda x: abs(x["diff_local"]), reverse=True)
     return results
 
 
@@ -222,8 +231,9 @@ def format_slack_message(all_results: list, rates: dict) -> dict:
         if mismatches:
             lines = []
             for m in mismatches[:15]:
-                direction = "📈" if m["diff_usd"] > 0 else "📉"
-                lines.append(f"{direction} `{m['sku']}` — Shopify: ${m['shopify_cost_usd']:.2f} vs Supplier: ${m['supplier_cost_usd']:.2f} (*{m['diff_pct']:+.1f}%*)")
+                direction = "📈" if m["diff_local"] > 0 else "📉"
+                c = m["currency"]
+                lines.append(f"{direction} `{m['sku']}` — Shopify: {c} {m['shopify_cost_local']:.2f} vs Supplier: {c} {m['supplier_cost_local']:.2f} (*{m['diff_pct']:+.1f}%*)")
             if len(mismatches) > 15:
                 lines.append(f"_...and {len(mismatches) - 15} more_")
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}})
