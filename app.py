@@ -165,12 +165,20 @@ def fetch_inventory_costs(domain: str, token: str, item_ids: list) -> dict:
         ids_str = ",".join(str(x) for x in batch)
         try:
             data = shopify_get(domain, token, "inventory_items", {"ids": ids_str})
-            for item in data.get("inventory_items", []):
+            items = data.get("inventory_items", [])
+            if i == 0 and items:
+                log.info(f"Sample inventory item response: {json.dumps(items[0])}")
+            fetched_ids = set()
+            for item in items:
+                fetched_ids.add(item["id"])
                 cost = item.get("cost")
-                if cost is not None:
+                if cost is not None and cost != "":
                     costs[item["id"]] = float(cost)
                 else:
                     costs[item["id"]] = None
+            missing_from_batch = set(batch) - fetched_ids
+            if missing_from_batch:
+                log.warning(f"Batch {i}: {len(missing_from_batch)} item IDs not returned by API")
         except Exception as e:
             log.error(f"Failed to fetch inventory batch starting at {i}: {e}")
     return costs
