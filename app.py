@@ -529,6 +529,7 @@ def parse_packing_list(wb) -> dict:
     totals = defaultdict(int)
     for sheet in wb.sheetnames:
         ws = wb[sheet]
+        sheet_count = 0
         for row in ws.iter_rows(min_row=2, values_only=True):
             # Find the attention/contents column (usually column 5 or 7, look for SKU patterns)
             for cell in row:
@@ -543,6 +544,9 @@ def parse_packing_list(wb) -> dict:
                     for sku, qty in matches:
                         norm = normalize_sku(sku)
                         totals[norm] += int(qty)
+                        sheet_count += int(qty)
+        if sheet_count > 0:
+            log.info(f"  Sheet '{sheet}': {sheet_count} units")
     return dict(totals)
 
 
@@ -738,9 +742,27 @@ def run_invoice_check(channel: str, file_urls: list):
         if only_in_invoice:
             blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"📄 *In invoice but not in packing list:*\n{', '.join(only_in_invoice)}"}})
         blocks.append({"type": "divider"})
+        # Calculate cost breakdown
+        overshipment_cost = sum(m["cost_impact"] for m in qty_mismatches if m["cost_impact"] > 0)
+        undershipment_cost = sum(m["cost_impact"] for m in qty_mismatches if m["cost_impact"] < 0)
+        invoice_only_cost = sum(inv["line_total"] for sku, inv in invoice_data.items() if sku not in packing_totals and inv["qty"] > 0)
         cost_diff = round(total_expected_cost - total_invoice_cost, 2)
         cost_status = "✅" if abs(cost_diff) < 0.50 else "⚠️"
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Cost Summary:*\n• Invoice product total: *${total_invoice_cost:,.2f}*\n• Expected from packing list: *${total_expected_cost:,.2f}*\n• Difference: {cost_status} *${cost_diff:+,.2f}*"}})
+        summary_lines = [
+            f"*Cost Summary:*",
+            f"• Invoice product total: *${total_invoice_cost:,.2f}*",
+            f"• Expected cost from packing list: *${total_expected_cost:,.2f}*",
+            f"• Difference: {cost_status} *${cost_diff:+,.2f}*",
+            f"",
+            f"*Breakdown:*",
+        ]
+        if overshipment_cost:
+            summary_lines.append(f"• 📈 Shipped more than invoiced: *${overshipment_cost:+,.2f}* (you received extra)")
+        if undershipment_cost:
+            summary_lines.append(f"• 📉 Invoiced more than shipped: *${undershipment_cost:,.2f}* (you're being overcharged)")
+        if invoice_only_cost:
+            summary_lines.append(f"• 📄 Invoiced but not in packing list: *${invoice_only_cost:,.2f}*")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(summary_lines)}})
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"✅ {len(qty_matches)} SKUs matched  |  ⚠️ {len(qty_mismatches)} mismatches  |  📦 {len(only_in_packing)} only in packing  |  📄 {len(only_in_invoice)} only in invoice"}]})
         slack_api("chat.postMessage", channel=channel, blocks=blocks, text="Invoice vs Packing List Check")
     except Exception as e:
