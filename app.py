@@ -524,6 +524,50 @@ def download_slack_file(url: str) -> bytes:
     return resp.content
 
 
+def build_known_skus() -> list:
+    """Build sorted list of known SKUs (longest first for greedy matching)."""
+    skus = set()
+    for sku in SUPPLIER_PRICES.keys():
+        skus.add(sku.upper())
+    # Add common aliases/variants
+    for alias in SKU_ALIASES.keys():
+        skus.add(alias.upper())
+    return sorted(skus, key=len, reverse=True)
+
+
+KNOWN_SKUS = build_known_skus()
+
+
+def split_concatenated_skus(text: str) -> list:
+    """Split a concatenated string like 'PEP_01MIK_03' into known SKUs.
+    Works on the normalized (no underscores/hyphens) version, then maps back.
+    Returns list of (sku, qty) tuples."""
+    # Normalize the input for matching
+    norm_text = text.upper().strip().replace("_", "").replace("-", "")
+    # Build normalized known SKUs mapped to originals
+    norm_to_orig = {}
+    for known in KNOWN_SKUS:
+        norm_known = known.replace("_", "").replace("-", "")
+        if norm_known not in norm_to_orig:
+            norm_to_orig[norm_known] = known
+    # Sort by length descending for greedy matching
+    sorted_norms = sorted(norm_to_orig.keys(), key=len, reverse=True)
+    results = []
+    pos = 0
+    while pos < len(norm_text):
+        matched = False
+        for norm_known in sorted_norms:
+            if norm_text[pos:].startswith(norm_known):
+                results.append((norm_to_orig[norm_known], 1))
+                pos += len(norm_known)
+                matched = True
+                break
+        if not matched:
+            log.warning(f"Could not match SKU in concatenated string at pos {pos}: '{norm_text[pos:]}' (original: '{text}')")
+            break
+    return results
+
+
 def parse_packing_list(wb) -> dict:
     """Parse packing list Excel. Returns {normalized_sku: total_qty}."""
     totals = defaultdict(int)
@@ -531,20 +575,32 @@ def parse_packing_list(wb) -> dict:
         ws = wb[sheet]
         sheet_count = 0
         for row in ws.iter_rows(min_row=2, values_only=True):
-            # Find the attention/contents column (usually column 5 or 7, look for SKU patterns)
             for cell in row:
                 if cell is None:
                     continue
                 cell_str = str(cell).strip()
                 if not cell_str:
                     continue
-                # Match patterns like NFS1*1, MIK_01 * 3, PEP_01*3
+                # Try SKU * QTY pattern first (e.g. NFS1*1, MIK_01 * 3)
                 matches = re.findall(r'([A-Za-z0-9_\-]+)\s*\*\s*(\d+)', cell_str)
                 if matches:
                     for sku, qty in matches:
                         norm = normalize_sku(sku)
                         totals[norm] += int(qty)
                         sheet_count += int(qty)
+                else:
+                    # Try concatenated SKU format (e.g. PEP_01MIK_03, BIO-MASKMIK_01)
+                    # Skip short strings, numbers, country codes, headers
+                    skip_values = {"tracking no", "tracking no.", "cn", "attention", "weight", "fee", "gb", "au", "us", "ca", "nz", "sg", "ae", "usa"}
+                    if (re.match(r'^[A-Za-z]', cell_str) and len(cell_str) >= 4
+                            and cell_str.lower() not in skip_values
+                            and not re.match(r'^\d', cell_str)):
+                        split_results = split_concatenated_skus(cell_str)
+                        if split_results:
+                            for sku, qty in split_results:
+                                norm = normalize_sku(sku)
+                                totals[norm] += qty
+                                sheet_count += qty
         if sheet_count > 0:
             log.info(f"  Sheet '{sheet}': {sheet_count} units")
     return dict(totals)
