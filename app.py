@@ -83,8 +83,15 @@ def convert_from_usd(amount: float, to_currency: str, rates: dict) -> float:
     return round(amount * rate, 4)
 
 
+SKU_ALIASES = {
+    "CLERA01": "CLEAR01",
+    "MEIP01": "MIEP01",
+}
+
+
 def normalize_sku(sku: str) -> str:
-    return sku.upper().strip().replace(" ", "").replace("-", "").replace("_", "")
+    norm = sku.upper().strip().replace(" ", "").replace("-", "").replace("_", "")
+    return SKU_ALIASES.get(norm, norm)
 
 
 def parse_sku_part(part: str):
