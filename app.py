@@ -159,7 +159,7 @@ def shopify_get(domain: str, token: str, endpoint: str, params: dict = None) -> 
 
 def fetch_all_products(domain: str, token: str) -> list:
     variants = []
-    params = {"limit": 250, "fields": "id,title,variants"}
+    params = {"limit": 250, "fields": "id,title,variants", "status": "active"}
     endpoint = f"https://{domain}/admin/api/{SHOPIFY_API_VERSION}/products.json"
     headers = {"X-Shopify-Access-Token": token}
     url = endpoint
