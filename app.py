@@ -420,7 +420,7 @@ def run_list_skus(response_url: str, market_filter: str):
                 chunk_len += len(line) + 1
             if chunk:
                 blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
-        slack_api("chat.postMessage", channel=INVOICE_CHANNEL, blocks=blocks, text=f"{market_filter.upper()} SKU List")
+        requests.post(response_url, json={"blocks": blocks, "response_type": "in_channel"}, timeout=10)
     except Exception as e:
         log.error(f"List SKUs failed: {e}", exc_info=True)
         requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Failed: {e}"})
