@@ -106,6 +106,8 @@ def convert_from_usd(amount: float, to_currency: str, rates: dict) -> float:
 SKU_ALIASES = {
     "CLERA01": "CLEAR01",
     "MEIP01": "MIEP01",
+    "NFS01": "NFS1",
+    "SPO1Q": "SP01Q",
 }
 
 
