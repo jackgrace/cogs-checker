@@ -189,8 +189,8 @@ def fetch_all_products(domain: str, token: str) -> list:
 
 def fetch_inventory_costs(domain: str, token: str, item_ids: list) -> dict:
     costs = {}
-    for i in range(0, len(item_ids), 100):
-        batch = item_ids[i:i+100]
+    for i in range(0, len(item_ids), 50):
+        batch = item_ids[i:i+50]
         ids_str = ",".join(str(x) for x in batch)
         try:
             data = shopify_get(domain, token, "inventory_items", {"ids": ids_str})
@@ -206,8 +206,9 @@ def fetch_inventory_costs(domain: str, token: str, item_ids: list) -> dict:
                 else:
                     costs[item["id"]] = None
             missing_from_batch = set(batch) - fetched_ids
-            if missing_from_batch:
-                log.warning(f"Batch {i}: {len(missing_from_batch)} item IDs not returned by API")
+            log.info(f"Batch {i}: sent {len(batch)}, got {len(fetched_ids)}, missing {len(missing_from_batch)}")
+            if missing_from_batch and len(missing_from_batch) <= 10:
+                log.warning(f"Batch {i} missing IDs: {list(missing_from_batch)}")
         except Exception as e:
             log.error(f"Failed to fetch inventory batch starting at {i}: {e}")
     return costs
