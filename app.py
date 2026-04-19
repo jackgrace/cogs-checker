@@ -360,6 +360,87 @@ def health():
     return jsonify({"status": "ok", "service": "cogs-checker", "skus_loaded": len(SUPPLIER_PRICES)})
 
 
+def run_list_skus(response_url: str, market_filter: str):
+    try:
+        stores = get_stores()
+        cfg = stores.get(market_filter)
+        if not cfg:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Unknown market `{market_filter}`."})
+            return
+        domain = cfg["domain"]
+        token = cfg["token"]
+        variants = fetch_all_products(domain, token)
+        item_ids = [v["inventory_item_id"] for v in variants if v["inventory_item_id"]]
+        costs = fetch_inventory_costs(domain, token, item_ids)
+        accessible = []
+        inaccessible = []
+        for v in variants:
+            inv_id = v["inventory_item_id"]
+            cost = costs.get(inv_id)
+            label = f"`{v['sku']}` — _{v['product_title']}_"
+            if inv_id not in costs:
+                inaccessible.append(label)
+            elif cost is not None:
+                accessible.append(f"{label} ({cfg['currency']} {cost:.2f})")
+            else:
+                inaccessible.append(f"{label} (null cost)")
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": f"📋 {market_filter.upper()} SKU List", "emoji": True}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*{len(accessible)}* accessible  |  *{len(inaccessible)}* inaccessible (API won't return cost)"}]},
+            {"type": "divider"},
+        ]
+        if accessible:
+            lines = [f"✅ *Accessible ({len(accessible)}):*"]
+            for line in accessible:
+                lines.append(f"• {line}")
+            chunk = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 2900:
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+        if inaccessible:
+            blocks.append({"type": "divider"})
+            lines = [f"🔒 *Inaccessible ({len(inaccessible)}):*"]
+            for line in inaccessible:
+                lines.append(f"• {line}")
+            chunk = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 2900:
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+        slack_api("chat.postMessage", channel=INVOICE_CHANNEL, blocks=blocks, text=f"{market_filter.upper()} SKU List")
+    except Exception as e:
+        log.error(f"List SKUs failed: {e}", exc_info=True)
+        requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Failed: {e}"})
+
+
+@app.route("/slack/list-skus", methods=["POST"])
+def slack_list_skus():
+    response_url = request.form.get("response_url")
+    text = request.form.get("text", "").strip().lower()
+    if not text:
+        return jsonify({"response_type": "ephemeral", "text": "Usage: `/cogs-list au` — list all SKUs for a store"})
+    stores = get_stores()
+    if text not in stores:
+        available = ", ".join(stores.keys())
+        return jsonify({"response_type": "ephemeral", "text": f"❌ Unknown market `{text}`. Available: {available}"})
+    thread = threading.Thread(target=run_list_skus, args=(response_url, text), daemon=True)
+    thread.start()
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Fetching SKU list for *{text.upper()}*..."})
+
+
 @app.route("/slack/cogs-check", methods=["POST"])
 def slack_cogs_check():
     response_url = request.form.get("response_url")
