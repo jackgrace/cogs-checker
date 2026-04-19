@@ -329,11 +329,13 @@ def format_slack_message(all_results: list, rates: dict) -> dict:
     return {"blocks": blocks, "response_type": "in_channel"}
 
 
-def run_cogs_check(response_url: str, market_filter: str = None):
+def run_cogs_check(response_url: str = None, market_filter: str = None, channel_id: str = None):
     try:
         stores = get_stores()
         if not stores:
-            requests.post(response_url, json={"response_type": "ephemeral", "text": "❌ No Shopify stores configured. Set SHOPIFY_STORES env var."})
+            msg = "❌ No Shopify stores configured. Set SHOPIFY_STORES env var."
+            if response_url:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": msg})
             return
         rates = fetch_fx_rates()
         all_results = []
@@ -347,13 +349,17 @@ def run_cogs_check(response_url: str, market_filter: str = None):
                 log.error(f"Error checking {market}: {e}")
                 all_results.append({"market": market.upper(), "currency": cfg["currency"], "total_skus": 0, "matches": [], "mismatches": [], "missing_from_supplier": [], "no_cost_in_shopify": [], "error": str(e)})
         message = format_slack_message(all_results, rates)
-        requests.post(response_url, json=message, timeout=10)
+        if response_url:
+            requests.post(response_url, json=message, timeout=10)
+        elif channel_id and SLACK_BOT_TOKEN:
+            slack_api("chat.postMessage", channel=channel_id, blocks=message["blocks"], text="Daily COGS Check Report")
     except Exception as e:
         log.error(f"COGS check failed: {e}")
-        try:
-            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ COGS check failed: {e}"})
-        except Exception:
-            pass
+        if response_url:
+            try:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ COGS check failed: {e}"})
+            except Exception:
+                pass
 
 
 @app.route("/", methods=["GET"])
@@ -578,6 +584,7 @@ import io
 from collections import defaultdict
 
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
 INVOICE_CHANNEL = os.environ.get("INVOICE_CHANNEL", "cogs-checker")
 
 # Track processed events to avoid duplicates
@@ -994,6 +1001,37 @@ def process_pending_files(channel_id: str):
         slack_api("chat.postMessage", channel=channel_id, text=f"⚠️ Received {len(files)} file(s) but need 3 (2 packing lists + 1 invoice).")
         return
     run_invoice_check(channel_id, files)
+
+
+DAILY_CHECK_HOUR = int(os.environ.get("DAILY_CHECK_HOUR", "0"))
+DAILY_CHECK_TZ_OFFSET = int(os.environ.get("DAILY_CHECK_TZ_OFFSET", "10"))
+
+
+def scheduled_daily_check():
+    """Run daily COGS check at configured hour in configured timezone."""
+    while True:
+        import time
+        now_utc = datetime.utcnow()
+        now_local = now_utc + timedelta(hours=DAILY_CHECK_TZ_OFFSET)
+        target = now_local.replace(hour=DAILY_CHECK_HOUR, minute=0, second=0, microsecond=0)
+        if now_local >= target:
+            target += timedelta(days=1)
+        wait_seconds = (target - now_local).total_seconds()
+        log.info(f"Next daily COGS check at {target} (local TZ offset +{DAILY_CHECK_TZ_OFFSET}h), waiting {wait_seconds/3600:.1f}h")
+        time.sleep(wait_seconds)
+        if SLACK_CHANNEL_ID and SLACK_BOT_TOKEN:
+            log.info("Running scheduled daily COGS check...")
+            try:
+                run_cogs_check(channel_id=SLACK_CHANNEL_ID)
+            except Exception as e:
+                log.error(f"Scheduled COGS check failed: {e}")
+        else:
+            log.warning("Skipping scheduled check: SLACK_CHANNEL_ID or SLACK_BOT_TOKEN not set")
+
+
+# Start scheduler thread when app loads (gunicorn compatible)
+_scheduler_thread = threading.Thread(target=scheduled_daily_check, daemon=True)
+_scheduler_thread.start()
 
 
 if __name__ == "__main__":
