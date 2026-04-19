@@ -406,25 +406,34 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
             # Batch fetch all costs upfront
             item_ids = [v["inventory_item_id"] for v in matched if v["inventory_item_id"]]
             costs = fetch_inventory_costs(domain, token, item_ids)
+            skipped_match = 0
+            skipped_no_cost = 0
+            skipped_no_supplier = 0
             for v in matched:
                 sku = v["sku"]
                 inv_id = v["inventory_item_id"]
                 s_cost_usd = lookup_supplier_cost_usd(sku)
                 if s_cost_usd is None:
+                    skipped_no_supplier += 1
                     continue
                 target_cost = round(convert_from_usd(s_cost_usd, currency, rates), 2)
                 current_cost = costs.get(inv_id)
                 if current_cost is None:
+                    skipped_no_cost += 1
                     continue
                 diff = round(current_cost - target_cost, 2)
                 pct_diff = round((diff / target_cost) * 100, 1) if target_cost else 0
                 if abs(diff) <= TOLERANCE_USD or abs(pct_diff) <= TOLERANCE_PCT:
+                    skipped_match += 1
                     continue
+                log.info(f"[{market.upper()}] Will update {sku} (inv_id={inv_id}): {currency} {current_cost:.4f} -> {currency} {target_cost:.4f} (diff={diff}, pct={pct_diff}%)")
                 try:
                     shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
                     results.append(f"✅ *{market.upper()}* `{sku}` {currency} {current_cost:.2f} → {currency} {target_cost:.2f} (was {pct_diff:+.1f}%)")
                 except Exception as e:
+                    log.error(f"[{market.upper()}] Update failed for {sku} (inv_id={inv_id}): {e}")
                     results.append(f"❌ *{market.upper()}* `{sku}` failed: {e}")
+            log.info(f"[{market.upper()}] Summary: {len(matched)} matched variants, {skipped_match} within tolerance, {skipped_no_cost} no cost, {skipped_no_supplier} no supplier price")
         if not results:
             if sku_filter:
                 requests.post(response_url, json={"response_type": "ephemeral", "text": f"✅ No updates needed for `{sku_filter}` — all within tolerance."})
