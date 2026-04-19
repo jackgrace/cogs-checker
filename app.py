@@ -402,13 +402,13 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
             fx_rate = rates.get(currency, 1.0)
             log.info(f"[{market.upper()}] Update using FX rate: 1 USD = {fx_rate} {currency}")
             variants = fetch_all_products(domain, token)
+            # Fetch ALL variant costs (same as check does) to avoid batch inconsistencies
+            all_item_ids = [v["inventory_item_id"] for v in variants if v["inventory_item_id"]]
+            costs = fetch_inventory_costs(domain, token, all_item_ids)
             if sku_filter:
                 matched = [v for v in variants if normalize_sku(v["sku"]) == normalize_sku(sku_filter)]
             else:
                 matched = [v for v in variants if lookup_supplier_cost_usd(v["sku"]) is not None]
-            # Batch fetch all costs upfront
-            item_ids = [v["inventory_item_id"] for v in matched if v["inventory_item_id"]]
-            costs = fetch_inventory_costs(domain, token, item_ids)
             skipped_match = 0
             skipped_no_cost = []
             skipped_no_supplier = 0
