@@ -307,7 +307,8 @@ def format_slack_message(all_results: list, rates: dict) -> dict:
             for m in mismatches:
                 direction = "📈" if m["diff_local"] > 0 else "📉"
                 c = m["currency"]
-                lines.append(f"{direction} `{m['sku']}` — Shopify: {c} {m['shopify_cost_local']:.2f} vs Supplier: {c} {m['supplier_cost_local']:.2f} (*{m['diff_pct']:+.1f}%*)")
+                product_label = f" _{m['product']}_" if m.get("product") else ""
+                lines.append(f"{direction} `{m['sku']}` — Shopify: {c} {m['shopify_cost_local']:.2f} vs Supplier: {c} {m['supplier_cost_local']:.2f} (*{m['diff_pct']:+.1f}%*){product_label}")
             chunk = []
             chunk_len = 0
             for line in lines:
@@ -409,11 +410,14 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
             item_ids = [v["inventory_item_id"] for v in matched if v["inventory_item_id"]]
             costs = fetch_inventory_costs(domain, token, item_ids)
             skipped_match = 0
-            skipped_no_cost = 0
+            skipped_no_cost = []
             skipped_no_supplier = 0
+            updated_ids = set()
             for v in matched:
                 sku = v["sku"]
                 inv_id = v["inventory_item_id"]
+                if inv_id in updated_ids:
+                    continue
                 s_cost_usd = lookup_supplier_cost_usd(sku)
                 if s_cost_usd is None:
                     skipped_no_supplier += 1
@@ -421,7 +425,7 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
                 target_cost = round(convert_from_usd(s_cost_usd, currency, rates), 2)
                 current_cost = costs.get(inv_id)
                 if current_cost is None:
-                    skipped_no_cost += 1
+                    skipped_no_cost.append(f"{sku} (inv_id={inv_id})")
                     continue
                 diff = round(current_cost - target_cost, 2)
                 pct_diff = round((diff / target_cost) * 100, 1) if target_cost else 0
@@ -432,10 +436,13 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
                 try:
                     shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
                     results.append(f"✅ *{market.upper()}* `{sku}` {currency} {current_cost:.2f} → {currency} {target_cost:.2f} (was {pct_diff:+.1f}%)")
+                    updated_ids.add(inv_id)
                 except Exception as e:
                     log.error(f"[{market.upper()}] Update failed for {sku} (inv_id={inv_id}): {e}")
                     results.append(f"❌ *{market.upper()}* `{sku}` failed: {e}")
-            log.info(f"[{market.upper()}] Summary: {len(matched)} matched variants, {skipped_match} within tolerance, {skipped_no_cost} no cost, {skipped_no_supplier} no supplier price")
+            log.info(f"[{market.upper()}] Summary: {len(matched)} matched variants, {skipped_match} within tolerance, {len(skipped_no_cost)} inaccessible, {skipped_no_supplier} no supplier price")
+            if skipped_no_cost:
+                log.warning(f"[{market.upper()}] Inaccessible variants (API won't return cost): {skipped_no_cost[:20]}")
         if not results:
             if sku_filter:
                 requests.post(response_url, json={"response_type": "ephemeral", "text": f"✅ No updates needed for `{sku_filter}` — all within tolerance."})
