@@ -175,6 +175,8 @@ def fetch_all_products(domain: str, token: str) -> list:
                         "variant_title": v.get("title", ""),
                         "sku": v["sku"].strip(),
                         "inventory_item_id": v.get("inventory_item_id"),
+                        "price": float(v["price"]) if v.get("price") else None,
+                        "compare_at_price": float(v["compare_at_price"]) if v.get("compare_at_price") else None,
                     })
         params = {}
         link = resp.headers.get("Link", "")
@@ -446,6 +448,110 @@ def slack_list_skus():
     thread = threading.Thread(target=run_list_skus, args=(response_url, text), daemon=True)
     thread.start()
     return jsonify({"response_type": "ephemeral", "text": f"⏳ Fetching SKU list for *{text.upper()}*..."})
+
+
+TARGET_MARGIN = float(os.environ.get("TARGET_MARGIN_PCT", "80"))
+
+
+def run_margin_analysis(response_url: str, market_filter: str):
+    try:
+        stores = get_stores()
+        cfg = stores.get(market_filter)
+        if not cfg:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Unknown market `{market_filter}`."})
+            return
+        domain = cfg["domain"]
+        token = cfg["token"]
+        currency = cfg["currency"]
+        variants = fetch_all_products(domain, token)
+        item_ids = [v["inventory_item_id"] for v in variants if v["inventory_item_id"]]
+        costs = fetch_inventory_costs(domain, token, item_ids)
+        seen_skus = set()
+        rows = []
+        for v in variants:
+            inv_id = v["inventory_item_id"]
+            cost = costs.get(inv_id)
+            price = v.get("price")
+            if cost is None or price is None or price == 0:
+                continue
+            sku = v["sku"]
+            # De-dupe by SKU + product (keep first occurrence)
+            key = f"{normalize_sku(sku)}|{v['product_title']}"
+            if key in seen_skus:
+                continue
+            seen_skus.add(key)
+            margin = round((price - cost) / price * 100, 1)
+            target_price = round(cost / (1 - TARGET_MARGIN / 100), 2)
+            price_diff = round(target_price - price, 2)
+            rows.append({
+                "sku": sku,
+                "product": v["product_title"],
+                "price": price,
+                "cost": cost,
+                "margin": margin,
+                "target_price": target_price,
+                "price_diff": price_diff,
+            })
+        rows.sort(key=lambda x: x["margin"])
+        below_target = [r for r in rows if r["margin"] < TARGET_MARGIN]
+        at_or_above = [r for r in rows if r["margin"] >= TARGET_MARGIN]
+        avg_margin = round(sum(r["margin"] for r in rows) / len(rows), 1) if rows else 0
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": f"📊 Margin Analysis — {market_filter.upper()}", "emoji": True}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*{len(rows)}* SKUs analyzed  |  *Avg margin:* {avg_margin}%  |  *Target:* {TARGET_MARGIN:.0f}%  |  *Below target:* {len(below_target)}  |  *Currency:* {currency}"}]},
+            {"type": "divider"},
+        ]
+        if below_target:
+            lines = [f"⚠️ *Below {TARGET_MARGIN:.0f}% margin ({len(below_target)}):*"]
+            for r in below_target:
+                icon = "🔴" if r["margin"] < 60 else "🟡" if r["margin"] < TARGET_MARGIN else "🟢"
+                lines.append(f"{icon} `{r['sku']}` — Price: {currency} {r['price']:.2f} | Cost: {currency} {r['cost']:.2f} | *Margin: {r['margin']:.1f}%* | {TARGET_MARGIN:.0f}% price: {currency} {r['target_price']:.2f} ({r['price_diff']:+.2f})")
+            chunk = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 2900:
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+        if at_or_above:
+            blocks.append({"type": "divider"})
+            lines = [f"✅ *At or above {TARGET_MARGIN:.0f}% margin ({len(at_or_above)}):*"]
+            for r in sorted(at_or_above, key=lambda x: x["margin"]):
+                lines.append(f"🟢 `{r['sku']}` — Price: {currency} {r['price']:.2f} | Cost: {currency} {r['cost']:.2f} | *Margin: {r['margin']:.1f}%* — _{r['product']}_")
+            chunk = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 2900:
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+        requests.post(response_url, json={"blocks": blocks, "response_type": "in_channel"}, timeout=10)
+    except Exception as e:
+        log.error(f"Margin analysis failed: {e}", exc_info=True)
+        requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Margin analysis failed: {e}"})
+
+
+@app.route("/slack/margin", methods=["POST"])
+def slack_margin():
+    response_url = request.form.get("response_url")
+    text = request.form.get("text", "").strip().lower()
+    if not text:
+        return jsonify({"response_type": "ephemeral", "text": "Usage: `/cogs-margin au` — margin analysis for a store"})
+    stores = get_stores()
+    if text not in stores:
+        available = ", ".join(stores.keys())
+        return jsonify({"response_type": "ephemeral", "text": f"❌ Unknown market `{text}`. Available: {available}"})
+    thread = threading.Thread(target=run_margin_analysis, args=(response_url, text), daemon=True)
+    thread.start()
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Running margin analysis for *{text.upper()}*..."})
 
 
 @app.route("/slack/cogs-check", methods=["POST"])
