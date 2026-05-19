@@ -216,7 +216,32 @@ def fetch_inventory_costs(domain: str, token: str, item_ids: list) -> dict:
     return costs
 
 
-def check_cogs_for_store(market: str, store_cfg: dict, rates: dict) -> dict:
+def fetch_us_store_costs() -> dict:
+    """Fetch all SKU costs from the US store as the USD source of truth.
+    Returns {normalized_sku: cost_usd}."""
+    stores = get_stores()
+    us_cfg = stores.get("us")
+    if not us_cfg:
+        log.error("US store not configured, cannot fetch source costs")
+        return {}
+    domain = us_cfg["domain"]
+    token = us_cfg["token"]
+    variants = fetch_all_products(domain, token)
+    item_ids = [v["inventory_item_id"] for v in variants if v["inventory_item_id"]]
+    costs = fetch_inventory_costs(domain, token, item_ids)
+    us_costs = {}
+    for v in variants:
+        inv_id = v["inventory_item_id"]
+        cost = costs.get(inv_id)
+        if cost is not None and cost > 0:
+            norm = normalize_sku(v["sku"])
+            if norm not in us_costs:
+                us_costs[norm] = cost
+    log.info(f"Fetched {len(us_costs)} SKU costs from US store")
+    return us_costs
+
+
+def check_cogs_for_store(market: str, store_cfg: dict, rates: dict, us_costs: dict) -> dict:
     domain = store_cfg["domain"]
     token = store_cfg["token"]
     currency = store_cfg["currency"]
@@ -245,31 +270,32 @@ def check_cogs_for_store(market: str, store_cfg: dict, rates: dict) -> dict:
         sku = v["sku"]
         inv_id = v["inventory_item_id"]
         if inv_id not in costs:
-            # Item not returned by API — likely managed by a bundle/subscription app
             continue
         shopify_cost_local = costs.get(inv_id)
-        supplier_cost_usd = lookup_supplier_cost_usd(sku)
+        # Look up source cost from US store
+        norm = normalize_sku(sku)
+        source_cost_usd = us_costs.get(norm)
         if shopify_cost_local is None:
             results["no_cost_in_shopify"].append({
                 "sku": sku,
                 "product": v["product_title"],
-                "supplier_cost_usd": supplier_cost_usd,
+                "supplier_cost_usd": source_cost_usd,
             })
             continue
-        if supplier_cost_usd is None:
+        if source_cost_usd is None:
             results["missing_from_supplier"].append({
                 "sku": sku,
                 "product": v["product_title"],
                 "shopify_cost_local": shopify_cost_local,
             })
             continue
-        supplier_cost_local = convert_from_usd(supplier_cost_usd, currency, rates)
+        supplier_cost_local = convert_from_usd(source_cost_usd, currency, rates)
         diff = round(shopify_cost_local - supplier_cost_local, 2)
         pct_diff = round((diff / supplier_cost_local) * 100, 1) if supplier_cost_local else 0
         entry = {
             "sku": sku,
             "product": v["product_title"],
-            "supplier_cost_usd": supplier_cost_usd,
+            "supplier_cost_usd": source_cost_usd,
             "supplier_cost_local": supplier_cost_local,
             "shopify_cost_local": shopify_cost_local,
             "diff_local": diff,
@@ -289,7 +315,7 @@ def format_slack_message(all_results: list, rates: dict) -> dict:
     fx_label = "🟢 Live FX rates" if fx_source == "live" else "🟡 Cached FX rates" if fx_source == "cached" else "🔴 Fallback FX rates (API unavailable)"
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "📦 COGS Check Report", "emoji": True}},
-        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Source:* {SUPPLIER_DATA['source']}  |  *Invoice Date:* {SUPPLIER_DATA['date']}  |  *Tolerance:* ${TOLERANCE_USD} / {TOLERANCE_PCT}%  |  {fx_label}"}]},
+        {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Source:* US Store (USD costs)  |  *Tolerance:* ${TOLERANCE_USD} / {TOLERANCE_PCT}%  |  {fx_label}"}]},
         {"type": "divider"},
     ]
     total_mismatches = 0
@@ -340,12 +366,20 @@ def run_cogs_check(response_url: str = None, market_filter: str = None, channel_
                 requests.post(response_url, json={"response_type": "ephemeral", "text": msg})
             return
         rates = fetch_fx_rates()
+        us_costs = fetch_us_store_costs()
+        if not us_costs:
+            msg = "❌ Could not fetch US store costs as source of truth."
+            if response_url:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": msg})
+            return
         all_results = []
         for market, cfg in stores.items():
+            if market == "us":
+                continue
             if market_filter and market != market_filter.lower():
                 continue
             try:
-                result = check_cogs_for_store(market, cfg, rates)
+                result = check_cogs_for_store(market, cfg, rates, us_costs)
                 all_results.append(result)
             except Exception as e:
                 log.error(f"Error checking {market}: {e}")
@@ -581,13 +615,19 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
     try:
         stores = get_stores()
         rates = fetch_fx_rates()
+        us_costs = fetch_us_store_costs()
+        if not us_costs:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": "❌ Could not fetch US store costs."})
+            return
         if sku_filter:
-            supplier_cost_usd = lookup_supplier_cost_usd(sku_filter)
-            if supplier_cost_usd is None:
-                requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ SKU `{sku_filter}` not found in supplier list."})
+            norm_filter = normalize_sku(sku_filter)
+            if norm_filter not in us_costs:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ SKU `{sku_filter}` not found in US store."})
                 return
         results = []
         for market, cfg in stores.items():
+            if market == "us":
+                continue
             if market_filter and market != market_filter.lower():
                 continue
             domain = cfg["domain"]
@@ -596,13 +636,12 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
             fx_rate = rates.get(currency, 1.0)
             log.info(f"[{market.upper()}] Update using FX rate: 1 USD = {fx_rate} {currency}")
             variants = fetch_all_products(domain, token)
-            # Fetch ALL variant costs (same as check does) to avoid batch inconsistencies
             all_item_ids = [v["inventory_item_id"] for v in variants if v["inventory_item_id"]]
             costs = fetch_inventory_costs(domain, token, all_item_ids)
             if sku_filter:
                 matched = [v for v in variants if normalize_sku(v["sku"]) == normalize_sku(sku_filter)]
             else:
-                matched = [v for v in variants if lookup_supplier_cost_usd(v["sku"]) is not None]
+                matched = [v for v in variants if normalize_sku(v["sku"]) in us_costs]
             skipped_match = 0
             skipped_no_cost = []
             skipped_no_supplier = 0
@@ -612,7 +651,8 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
                 inv_id = v["inventory_item_id"]
                 if inv_id in updated_ids:
                     continue
-                s_cost_usd = lookup_supplier_cost_usd(sku)
+                norm = normalize_sku(sku)
+                s_cost_usd = us_costs.get(norm)
                 if s_cost_usd is None:
                     skipped_no_supplier += 1
                     continue
