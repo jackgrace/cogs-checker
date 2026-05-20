@@ -460,6 +460,49 @@ def health():
     return jsonify({"status": "ok", "service": "cogs-checker", "skus_loaded": len(SUPPLIER_PRICES)})
 
 
+@app.route("/oauth/callback", methods=["GET"])
+def oauth_callback():
+    """Handle OAuth callback from Shopify app install flow."""
+    code = request.args.get("code")
+    shop = request.args.get("shop", "")
+    if not code or not shop:
+        return "Missing code or shop parameter", 400
+    # Find which store this is for
+    client_id = None
+    client_secret = None
+    market = None
+    for m, cfg in STORE_CONFIG.items():
+        if cfg["domain"] == shop and cfg.get("oauth"):
+            client_id = os.environ.get(cfg["client_id_env"], "")
+            client_secret = os.environ.get(cfg["client_secret_env"], "")
+            market = m
+            break
+    if not client_id:
+        return f"Unknown shop: {shop}", 400
+    # Exchange code for permanent token
+    try:
+        resp = requests.post(
+            f"https://{shop}/admin/oauth/access_token",
+            json={"client_id": client_id, "client_secret": client_secret, "code": code},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data.get("access_token", "")
+        scope = data.get("scope", "")
+        log.info(f"OAuth install complete for {shop}: scope={scope}")
+        # Cache this token permanently
+        _oauth_tokens[shop] = {"token": token, "expires_at": datetime.utcnow() + timedelta(days=365)}
+        return f"""<h2>✅ {market.upper()} Store Connected</h2>
+        <p>Token received with scopes: <code>{scope}</code></p>
+        <p><b>Important:</b> Set this as <code>SHOPIFY_TOKEN_UAE</code> in Railway for permanent access:</p>
+        <pre>{token}</pre>
+        <p>You can close this window.</p>"""
+    except Exception as e:
+        log.error(f"OAuth token exchange failed: {e}")
+        return f"Token exchange failed: {e}", 500
+
+
 def run_list_skus(response_url: str, market_filter: str):
     try:
         stores = get_stores()
