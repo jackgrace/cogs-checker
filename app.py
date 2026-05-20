@@ -820,6 +820,83 @@ def run_price_csv(channel_id: str, target_market: str):
         slack_api("chat.postMessage", channel=channel_id, text=f"❌ CSV generation failed: {e}")
 
 
+@app.route("/slack/test-write", methods=["POST"])
+def slack_test_write():
+    """Test if we can write to the UAE store — tries a single variant price update."""
+    response_url = request.form.get("response_url")
+    text = request.form.get("text", "").strip().lower()
+    if not text:
+        return jsonify({"response_type": "ephemeral", "text": "Usage: `/cogs-test uae`"})
+    stores = get_stores()
+    cfg = stores.get(text)
+    if not cfg:
+        return jsonify({"response_type": "ephemeral", "text": f"❌ Unknown market `{text}`."})
+
+    def run_test(response_url, market, cfg):
+        try:
+            domain = cfg["domain"]
+            token = cfg["token"]
+            variants = fetch_all_products(domain, token)
+            if not variants:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": "❌ No variants found."})
+                return
+            v = variants[0]
+            variant_id = v["variant_id"]
+            current_price = v["price"]
+            lines = [f"*Testing write access to {market.upper()}*", f"Variant: `{v['sku']}` — {v['product_title']}", f"Current price: {current_price}", ""]
+            # Test 1: REST PUT variant (set same price)
+            try:
+                url = f"https://{domain}/admin/api/{SHOPIFY_API_VERSION}/variants/{variant_id}.json"
+                headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+                resp = requests.put(url, headers=headers, json={"variant": {"id": variant_id, "price": str(current_price)}}, timeout=15)
+                lines.append(f"REST PUT /variants/{variant_id}: *{resp.status_code}*")
+                if resp.status_code != 200:
+                    lines.append(f"Response: `{resp.text[:300]}`")
+            except Exception as e:
+                lines.append(f"REST PUT variant: ❌ {e}")
+            # Test 2: GraphQL productVariantsBulkUpdate
+            try:
+                gid = f"gid://shopify/ProductVariant/{variant_id}"
+                product_gid = f"gid://shopify/Product/{v.get('product_id', '')}"
+                mutation = """
+                mutation($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+                    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                        productVariants { id }
+                        userErrors { field message }
+                    }
+                }"""
+                result = shopify_graphql(domain, token, mutation, {"productId": product_gid, "variants": [{"id": gid, "price": str(current_price)}]})
+                user_errors = result.get("data", {}).get("productVariantsBulkUpdate", {}).get("userErrors", [])
+                if user_errors:
+                    lines.append(f"GraphQL productVariantsBulkUpdate: ⚠️ userErrors: {user_errors}")
+                else:
+                    lines.append(f"GraphQL productVariantsBulkUpdate: ✅ success")
+            except Exception as e:
+                lines.append(f"GraphQL productVariantsBulkUpdate: ❌ {e}")
+            # Test 3: REST PUT inventory_items (cost)
+            try:
+                inv_id = v["inventory_item_id"]
+                item_ids = [inv_id]
+                costs = fetch_inventory_costs(domain, token, item_ids)
+                current_cost = costs.get(inv_id)
+                if current_cost is not None:
+                    url = f"https://{domain}/admin/api/{SHOPIFY_API_VERSION}/inventory_items/{inv_id}.json"
+                    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+                    resp = requests.put(url, headers=headers, json={"inventory_item": {"id": inv_id, "cost": str(current_cost)}}, timeout=15)
+                    lines.append(f"REST PUT inventory_items/{inv_id} (cost): *{resp.status_code}*")
+                else:
+                    lines.append(f"REST PUT inventory cost: skipped (no cost)")
+            except Exception as e:
+                lines.append(f"REST PUT inventory cost: ❌ {e}")
+            requests.post(response_url, json={"response_type": "in_channel", "text": "\n".join(lines)})
+        except Exception as e:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Test failed: {e}"})
+
+    thread = threading.Thread(target=run_test, args=(response_url, text, cfg), daemon=True)
+    thread.start()
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Testing write access to *{text.upper()}*..."})
+
+
 @app.route("/slack/price-csv", methods=["POST"])
 def slack_price_csv():
     response_url = request.form.get("response_url")
