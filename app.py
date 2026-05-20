@@ -36,20 +36,61 @@ STORE_CONFIG = {
     "us": {"domain": "domainholdings.myshopify.com", "currency": "USD", "token_env": "SHOPIFY_TOKEN_US"},
     "ca": {"domain": "lux-iplpro.myshopify.com", "currency": "CAD", "token_env": "SHOPIFY_TOKEN_CA"},
     "eu": {"domain": "lux-skin-europe.myshopify.com", "currency": "EUR", "token_env": "SHOPIFY_TOKEN_EU"},
-    "uae": {"domain": "lux-skin-uae.myshopify.com", "currency": "AED", "token_env": "SHOPIFY_TOKEN_UAE"},
+    "uae": {"domain": "lux-skin-uae.myshopify.com", "currency": "AED", "token_env": "SHOPIFY_TOKEN_UAE", "oauth": True, "client_id_env": "SHOPIFY_UAE_CLIENT_ID", "client_secret_env": "SHOPIFY_UAE_CLIENT_SECRET"},
 }
+
+_oauth_tokens = {}
+
+
+def get_oauth_token(domain: str, client_id: str, client_secret: str) -> str:
+    cache = _oauth_tokens.get(domain)
+    if cache and cache["expires_at"] > datetime.utcnow():
+        return cache["token"]
+    try:
+        resp = requests.post(
+            f"https://{domain}/admin/oauth/access_token",
+            json={"client_id": client_id, "client_secret": client_secret, "grant_type": "client_credentials"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        token = data["access_token"]
+        expires_in = data.get("expires_in", 86399)
+        _oauth_tokens[domain] = {
+            "token": token,
+            "expires_at": datetime.utcnow() + timedelta(seconds=expires_in - 300),
+        }
+        log.info(f"OAuth token refreshed for {domain} (expires in {expires_in}s)")
+        return token
+    except Exception as e:
+        log.error(f"OAuth token fetch failed for {domain}: {e}")
+        if cache:
+            return cache["token"]
+        return ""
 
 
 def get_stores() -> dict:
     stores = {}
     for market, cfg in STORE_CONFIG.items():
-        token = os.environ.get(cfg["token_env"], "")
-        if token:
-            stores[market] = {
-                "domain": cfg["domain"],
-                "token": token,
-                "currency": cfg["currency"],
-            }
+        if cfg.get("oauth"):
+            client_id = os.environ.get(cfg["client_id_env"], "")
+            client_secret = os.environ.get(cfg["client_secret_env"], "")
+            if client_id and client_secret:
+                token = get_oauth_token(cfg["domain"], client_id, client_secret)
+                if token:
+                    stores[market] = {
+                        "domain": cfg["domain"],
+                        "token": token,
+                        "currency": cfg["currency"],
+                    }
+        else:
+            token = os.environ.get(cfg["token_env"], "")
+            if token:
+                stores[market] = {
+                    "domain": cfg["domain"],
+                    "token": token,
+                    "currency": cfg["currency"],
+                }
     return stores
 
 
