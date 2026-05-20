@@ -758,6 +758,84 @@ def slack_sync_store():
     return jsonify({"response_type": "ephemeral", "text": f"⏳ Syncing US → *{text.upper()}*... This may take a while."})
 
 
+def run_price_csv(channel_id: str, target_market: str):
+    """Generate a Shopify product CSV with converted prices for import."""
+    try:
+        import csv as csv_mod
+        stores = get_stores()
+        us_cfg = stores.get("us")
+        target_cfg = stores.get(target_market)
+        if not us_cfg or not target_cfg:
+            slack_api("chat.postMessage", channel=channel_id, text="❌ US or target store not configured.")
+            return
+        rates = fetch_fx_rates()
+        target_currency = target_cfg["currency"]
+        fx_rate = rates.get(target_currency, 1.0)
+        # Fetch US data
+        us_variants = fetch_all_products(us_cfg["domain"], us_cfg["token"])
+        us_item_ids = [v["inventory_item_id"] for v in us_variants if v["inventory_item_id"]]
+        us_costs = fetch_inventory_costs(us_cfg["domain"], us_cfg["token"], us_item_ids)
+        us_ref = {}
+        for v in us_variants:
+            norm = normalize_sku(v["sku"])
+            inv_id = v["inventory_item_id"]
+            cost = us_costs.get(inv_id)
+            if norm not in us_ref and v.get("price") and cost:
+                us_ref[norm] = {"price": v["price"], "compare_at_price": v.get("compare_at_price"), "cost": cost}
+        # Fetch target store variants
+        target_variants = fetch_all_products(target_cfg["domain"], target_cfg["token"])
+        # Build CSV
+        output = io.StringIO()
+        writer = csv_mod.writer(output)
+        writer.writerow(["Handle", "Title", "Variant SKU", "Variant Price", "Variant Compare At Price", "Variant Cost per item"])
+        seen = set()
+        for v in target_variants:
+            norm = normalize_sku(v["sku"])
+            us_data = us_ref.get(norm)
+            if not us_data:
+                continue
+            key = f"{v['product_id']}|{v['variant_id']}"
+            if key in seen:
+                continue
+            seen.add(key)
+            converted_price = round(us_data["price"] * fx_rate, 2)
+            converted_cost = round(us_data["cost"] * fx_rate, 2)
+            converted_compare = round(us_data["compare_at_price"] * fx_rate, 2) if us_data.get("compare_at_price") else ""
+            handle = v["product_title"].lower().replace(" ", "-").replace("|", "").replace("®", "").replace("™", "").strip("-")
+            writer.writerow([handle, v["product_title"], v["sku"], converted_price, converted_compare, converted_cost])
+        csv_content = output.getvalue()
+        # Upload to Slack
+        resp = requests.post(
+            "https://slack.com/api/files.upload",
+            headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+            data={"channels": channel_id, "filename": f"prices_{target_market}_{target_currency}.csv", "title": f"Price CSV — {target_market.upper()} ({target_currency}, 1 USD = {fx_rate})"},
+            files={"file": ("prices.csv", csv_content, "text/csv")},
+            timeout=30,
+        )
+        if not resp.json().get("ok"):
+            log.error(f"CSV upload failed: {resp.json().get('error')}")
+            slack_api("chat.postMessage", channel=channel_id, text=f"❌ CSV upload failed: {resp.json().get('error')}")
+    except Exception as e:
+        log.error(f"Price CSV generation failed: {e}", exc_info=True)
+        slack_api("chat.postMessage", channel=channel_id, text=f"❌ CSV generation failed: {e}")
+
+
+@app.route("/slack/price-csv", methods=["POST"])
+def slack_price_csv():
+    response_url = request.form.get("response_url")
+    channel_id = request.form.get("channel_id", "")
+    text = request.form.get("text", "").strip().lower()
+    if not text or text == "us":
+        return jsonify({"response_type": "ephemeral", "text": "Usage: `/cogs-csv uae` — generate price CSV for Shopify import"})
+    stores = get_stores()
+    if text not in stores:
+        available = ", ".join(k for k in stores.keys() if k != "us")
+        return jsonify({"response_type": "ephemeral", "text": f"❌ Unknown market `{text}`. Available: {available}"})
+    thread = threading.Thread(target=run_price_csv, args=(channel_id, text), daemon=True)
+    thread.start()
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Generating price CSV for *{text.upper()}*..."})
+
+
 @app.route("/slack/cogs-check", methods=["POST"])
 def slack_cogs_check():
     response_url = request.form.get("response_url")
