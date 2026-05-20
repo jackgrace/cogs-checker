@@ -705,14 +705,15 @@ def run_sync_store(response_url: str, target_market: str):
         us_variants = fetch_all_products(us_cfg["domain"], us_cfg["token"])
         us_item_ids = [v["inventory_item_id"] for v in us_variants if v["inventory_item_id"]]
         us_costs = fetch_inventory_costs(us_cfg["domain"], us_cfg["token"], us_item_ids)
-        # Build US SKU reference: {normalized_sku: {price, cost, weight, grams}}
-        us_ref = {}
+        # Build US SKU reference keyed by (normalized_sku, product_title) and also just sku as fallback
+        us_ref_by_product = {}
+        us_ref_by_sku = {}
         for v in us_variants:
             norm = normalize_sku(v["sku"])
             inv_id = v["inventory_item_id"]
             cost = us_costs.get(inv_id)
-            if norm not in us_ref and v.get("price") and cost:
-                us_ref[norm] = {
+            if v.get("price") and cost:
+                entry = {
                     "price": v["price"],
                     "compare_at_price": v.get("compare_at_price"),
                     "cost": cost,
@@ -720,7 +721,12 @@ def run_sync_store(response_url: str, target_market: str):
                     "weight_unit": v.get("weight_unit"),
                     "grams": v.get("grams"),
                 }
-        log.info(f"US reference: {len(us_ref)} SKUs with price + cost")
+                key = f"{norm}|{v['product_title']}"
+                if key not in us_ref_by_product:
+                    us_ref_by_product[key] = entry
+                if norm not in us_ref_by_sku:
+                    us_ref_by_sku[norm] = entry
+        log.info(f"US reference: {len(us_ref_by_sku)} unique SKUs, {len(us_ref_by_product)} SKU+product combos")
         # Fetch target store data
         target_domain = target_cfg["domain"]
         target_token = target_cfg["token"]
@@ -735,7 +741,9 @@ def run_sync_store(response_url: str, target_market: str):
             variant_id = v.get("variant_id")
             if not variant_id or inv_id in updated_ids:
                 continue
-            us_data = us_ref.get(norm)
+            # Try matching by SKU + product title first, fall back to SKU only
+            key = f"{norm}|{v['product_title']}"
+            us_data = us_ref_by_product.get(key) or us_ref_by_sku.get(norm)
             if not us_data:
                 continue
             converted_price = round(us_data["price"] * fx_rate, 2)
