@@ -36,7 +36,7 @@ STORE_CONFIG = {
     "us": {"domain": "domainholdings.myshopify.com", "currency": "USD", "token_env": "SHOPIFY_TOKEN_US"},
     "ca": {"domain": "lux-iplpro.myshopify.com", "currency": "CAD", "token_env": "SHOPIFY_TOKEN_CA"},
     "eu": {"domain": "lux-skin-europe.myshopify.com", "currency": "EUR", "token_env": "SHOPIFY_TOKEN_EU"},
-    "uae": {"domain": "lux-skin-uae.myshopify.com", "currency": "AED", "token_env": "SHOPIFY_TOKEN_UAE", "oauth": True, "client_id_env": "SHOPIFY_UAE_CLIENT_ID", "client_secret_env": "SHOPIFY_UAE_CLIENT_SECRET"},
+    "uae": {"domain": "lux-skin-uae.myshopify.com", "currency": "AED", "token_env": "SHOPIFY_TOKEN_UAE"},
 }
 
 _oauth_tokens = {}
