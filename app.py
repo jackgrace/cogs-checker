@@ -106,10 +106,20 @@ def fetch_fx_rates() -> dict:
         data = resp.json()
         rates = data.get("rates", {})
         rates["USD"] = 1.0
+        # Frankfurter doesn't include AED — fetch from backup if missing
+        if "AED" not in rates:
+            try:
+                resp2 = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+                resp2.raise_for_status()
+                backup_rates = resp2.json().get("rates", {})
+                if "AED" in backup_rates:
+                    rates["AED"] = backup_rates["AED"]
+            except Exception:
+                rates["AED"] = 3.6725
         _fx_cache["rates"] = rates
         _fx_cache["fetched_at"] = now
         _fx_cache["source"] = "live"
-        log.info(f"FX rates refreshed from frankfurter: AUD={rates.get('AUD')}, GBP={rates.get('GBP')}, CAD={rates.get('CAD')}, EUR={rates.get('EUR')}")
+        log.info(f"FX rates refreshed: AUD={rates.get('AUD')}, GBP={rates.get('GBP')}, CAD={rates.get('CAD')}, EUR={rates.get('EUR')}, AED={rates.get('AED')}")
         return rates
     except Exception as e:
         log.error(f"Frankfurter FX fetch failed: {e}")
@@ -132,7 +142,7 @@ def fetch_fx_rates() -> dict:
         return _fx_cache["rates"]
     log.error("No FX rates available, using hardcoded fallback")
     _fx_cache["source"] = "fallback"
-    return {"USD": 1.0, "AUD": 1.44, "GBP": 0.77, "CAD": 1.39, "EUR": 0.88}
+    return {"USD": 1.0, "AUD": 1.44, "GBP": 0.77, "CAD": 1.39, "EUR": 0.88, "AED": 3.67}
 
 
 def convert_from_usd(amount: float, to_currency: str, rates: dict) -> float:
