@@ -699,33 +699,33 @@ def run_sync_store(response_url: str, target_market: str):
             converted_cost = round(us_data["cost"] * fx_rate, 2)
             converted_compare = round(us_data["compare_at_price"] * fx_rate, 2) if us_data.get("compare_at_price") else None
             try:
-                # Update variant price and weight via GraphQL
-                gid = f"gid://shopify/ProductVariant/{variant_id}"
-                mutation = """
-                mutation variantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-                    productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-                        productVariants { id }
-                        userErrors { field message }
-                    }
-                }"""
-                variant_input = {"id": gid, "price": str(converted_price)}
-                if converted_compare:
-                    variant_input["compareAtPrice"] = str(converted_compare)
-                # Need product GID — derive from variant lookup
-                product_gid = f"gid://shopify/Product/{v.get('product_id', '')}"
-                # Fallback: use individual variant update via REST on product
-                # Try GraphQL first
+                # Update cost via inventory item (works with OAuth tokens)
+                shopify_put(target_domain, target_token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(converted_cost)}})
+                # Try updating price via GraphQL
+                price_updated = False
                 try:
+                    gid = f"gid://shopify/ProductVariant/{variant_id}"
+                    product_gid = f"gid://shopify/Product/{v.get('product_id', '')}"
+                    mutation = """
+                    mutation variantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+                        productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                            productVariants { id }
+                            userErrors { field message }
+                        }
+                    }"""
+                    variant_input = {"id": gid, "price": str(converted_price)}
+                    if converted_compare:
+                        variant_input["compareAtPrice"] = str(converted_compare)
                     gql_result = shopify_graphql(target_domain, target_token, mutation, {"productId": product_gid, "variants": [variant_input]})
                     user_errors = gql_result.get("data", {}).get("productVariantsBulkUpdate", {}).get("userErrors", [])
-                    if user_errors:
-                        raise Exception(f"userErrors: {user_errors}")
+                    if not user_errors:
+                        price_updated = True
                 except Exception:
-                    # Fallback: direct REST price update via variant
-                    shopify_put(target_domain, target_token, f"variants/{variant_id}", {"variant": {"id": variant_id, "price": str(converted_price)}})
-                # Update cost via REST inventory item endpoint
-                shopify_put(target_domain, target_token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(converted_cost)}})
-                results.append(f"✅ `{v['sku']}` — Price: {target_currency} {converted_price:.2f} | Cost: {target_currency} {converted_cost:.2f}")
+                    pass
+                if price_updated:
+                    results.append(f"✅ `{v['sku']}` — Price: {target_currency} {converted_price:.2f} | Cost: {target_currency} {converted_cost:.2f}")
+                else:
+                    results.append(f"🟡 `{v['sku']}` — Cost: {target_currency} {converted_cost:.2f} ✅ | Price: {target_currency} {converted_price:.2f} ⚠️ needs manual update")
                 updated_ids.add(inv_id)
             except Exception as e:
                 results.append(f"❌ `{v['sku']}` — {e}")
