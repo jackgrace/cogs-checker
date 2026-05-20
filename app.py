@@ -22,7 +22,7 @@ with open(PRICE_LIST_PATH) as f:
     SUPPLIER_DATA = json.load(f)
 SUPPLIER_PRICES = SUPPLIER_DATA["prices"]
 
-SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2024-10")
+SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-04")
 TOLERANCE_USD = float(os.environ.get("COGS_TOLERANCE_USD", "0.10"))
 TOLERANCE_PCT = float(os.environ.get("COGS_TOLERANCE_PCT", "3.0"))
 
