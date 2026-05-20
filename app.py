@@ -697,17 +697,28 @@ def run_sync_store(response_url: str, target_market: str):
             converted_price = round(us_data["price"] * fx_rate, 2)
             converted_cost = round(us_data["cost"] * fx_rate, 2)
             converted_compare = round(us_data["compare_at_price"] * fx_rate, 2) if us_data.get("compare_at_price") else None
-            # Update variant price and weight
-            variant_payload = {"variant": {"id": variant_id, "price": str(converted_price)}}
-            if converted_compare:
-                variant_payload["variant"]["compare_at_price"] = str(converted_compare)
-            if us_data.get("grams"):
-                variant_payload["variant"]["grams"] = us_data["grams"]
-            # Update cost via inventory item
-            cost_payload = {"inventory_item": {"id": inv_id, "cost": str(converted_cost)}}
             try:
-                shopify_put(target_domain, target_token, f"variants/{variant_id}", variant_payload)
-                shopify_put(target_domain, target_token, f"inventory_items/{inv_id}", cost_payload)
+                # Update variant price and weight via GraphQL
+                gid = f"gid://shopify/ProductVariant/{variant_id}"
+                mutation = """
+                mutation variantUpdate($input: ProductVariantInput!) {
+                    productVariantUpdate(input: $input) {
+                        productVariant { id }
+                        userErrors { field message }
+                    }
+                }"""
+                variant_input = {"id": gid, "price": str(converted_price)}
+                if converted_compare:
+                    variant_input["compareAtPrice"] = str(converted_compare)
+                if us_data.get("weight"):
+                    variant_input["weight"] = us_data["weight"]
+                    variant_input["weightUnit"] = (us_data.get("weight_unit") or "KILOGRAMS").upper()
+                gql_result = shopify_graphql(target_domain, target_token, mutation, {"input": variant_input})
+                user_errors = gql_result.get("data", {}).get("productVariantUpdate", {}).get("userErrors", [])
+                if user_errors:
+                    raise Exception(f"GraphQL userErrors: {user_errors}")
+                # Update cost via REST inventory item endpoint
+                shopify_put(target_domain, target_token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(converted_cost)}})
                 results.append(f"✅ `{v['sku']}` — Price: {target_currency} {converted_price:.2f} | Cost: {target_currency} {converted_cost:.2f}")
                 updated_ids.add(inv_id)
             except Exception as e:
@@ -762,6 +773,20 @@ def shopify_put(domain: str, token: str, endpoint: str, payload: dict) -> dict:
     resp = requests.put(url, headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()
+
+
+def shopify_graphql(domain: str, token: str, query: str, variables: dict = None) -> dict:
+    url = f"https://{domain}/admin/api/{SHOPIFY_API_VERSION}/graphql.json"
+    headers = {"X-Shopify-Access-Token": token, "Content-Type": "application/json"}
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("errors"):
+        raise Exception(f"GraphQL errors: {data['errors']}")
+    return data
 
 
 def run_update_price(response_url: str, sku_filter: str = None, market_filter: str = None):
