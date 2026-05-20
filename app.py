@@ -36,6 +36,7 @@ STORE_CONFIG = {
     "us": {"domain": "domainholdings.myshopify.com", "currency": "USD", "token_env": "SHOPIFY_TOKEN_US"},
     "ca": {"domain": "lux-iplpro.myshopify.com", "currency": "CAD", "token_env": "SHOPIFY_TOKEN_CA"},
     "eu": {"domain": "lux-skin-europe.myshopify.com", "currency": "EUR", "token_env": "SHOPIFY_TOKEN_EU"},
+    "uae": {"domain": "lux-skin-uae.myshopify.com", "currency": "AED", "token_env": "SHOPIFY_TOKEN_UAE"},
 }
 
 
@@ -174,9 +175,13 @@ def fetch_all_products(domain: str, token: str) -> list:
                         "product_title": product["title"],
                         "variant_title": v.get("title", ""),
                         "sku": v["sku"].strip(),
+                        "variant_id": v.get("id"),
                         "inventory_item_id": v.get("inventory_item_id"),
                         "price": float(v["price"]) if v.get("price") else None,
                         "compare_at_price": float(v["compare_at_price"]) if v.get("compare_at_price") else None,
+                        "weight": v.get("weight"),
+                        "weight_unit": v.get("weight_unit"),
+                        "grams": v.get("grams"),
                     })
         params = {}
         link = resp.headers.get("Link", "")
@@ -586,6 +591,103 @@ def slack_margin():
     thread = threading.Thread(target=run_margin_analysis, args=(response_url, text), daemon=True)
     thread.start()
     return jsonify({"response_type": "ephemeral", "text": f"⏳ Running margin analysis for *{text.upper()}*..."})
+
+
+def run_sync_store(response_url: str, target_market: str):
+    """One-time sync: copy US store prices, costs, and weights to target store with FX conversion."""
+    try:
+        stores = get_stores()
+        us_cfg = stores.get("us")
+        target_cfg = stores.get(target_market)
+        if not us_cfg or not target_cfg:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": "❌ US or target store not configured."})
+            return
+        rates = fetch_fx_rates()
+        target_currency = target_cfg["currency"]
+        fx_rate = rates.get(target_currency, 1.0)
+        log.info(f"Syncing US → {target_market.upper()} at 1 USD = {fx_rate} {target_currency}")
+        # Fetch US store data
+        us_variants = fetch_all_products(us_cfg["domain"], us_cfg["token"])
+        us_item_ids = [v["inventory_item_id"] for v in us_variants if v["inventory_item_id"]]
+        us_costs = fetch_inventory_costs(us_cfg["domain"], us_cfg["token"], us_item_ids)
+        # Build US SKU reference: {normalized_sku: {price, cost, weight, grams}}
+        us_ref = {}
+        for v in us_variants:
+            norm = normalize_sku(v["sku"])
+            inv_id = v["inventory_item_id"]
+            cost = us_costs.get(inv_id)
+            if norm not in us_ref and v.get("price") and cost:
+                us_ref[norm] = {
+                    "price": v["price"],
+                    "compare_at_price": v.get("compare_at_price"),
+                    "cost": cost,
+                    "weight": v.get("weight"),
+                    "weight_unit": v.get("weight_unit"),
+                    "grams": v.get("grams"),
+                }
+        log.info(f"US reference: {len(us_ref)} SKUs with price + cost")
+        # Fetch target store data
+        target_domain = target_cfg["domain"]
+        target_token = target_cfg["token"]
+        target_variants = fetch_all_products(target_domain, target_token)
+        target_item_ids = [v["inventory_item_id"] for v in target_variants if v["inventory_item_id"]]
+        target_costs = fetch_inventory_costs(target_domain, target_token, target_item_ids)
+        results = []
+        updated_ids = set()
+        for v in target_variants:
+            norm = normalize_sku(v["sku"])
+            inv_id = v["inventory_item_id"]
+            variant_id = v.get("variant_id")
+            if not variant_id or inv_id in updated_ids:
+                continue
+            us_data = us_ref.get(norm)
+            if not us_data:
+                continue
+            converted_price = round(us_data["price"] * fx_rate, 2)
+            converted_cost = round(us_data["cost"] * fx_rate, 2)
+            converted_compare = round(us_data["compare_at_price"] * fx_rate, 2) if us_data.get("compare_at_price") else None
+            # Update variant price and weight
+            variant_payload = {"variant": {"id": variant_id, "price": str(converted_price)}}
+            if converted_compare:
+                variant_payload["variant"]["compare_at_price"] = str(converted_compare)
+            if us_data.get("grams"):
+                variant_payload["variant"]["grams"] = us_data["grams"]
+            # Update cost via inventory item
+            cost_payload = {"inventory_item": {"id": inv_id, "cost": str(converted_cost)}}
+            try:
+                shopify_put(target_domain, target_token, f"variants/{variant_id}", variant_payload)
+                shopify_put(target_domain, target_token, f"inventory_items/{inv_id}", cost_payload)
+                results.append(f"✅ `{v['sku']}` — Price: {target_currency} {converted_price:.2f} | Cost: {target_currency} {converted_cost:.2f}")
+                updated_ids.add(inv_id)
+            except Exception as e:
+                results.append(f"❌ `{v['sku']}` — {e}")
+        if not results:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ No matching SKUs found between US and {target_market.upper()} stores."})
+            return
+        header = f"*Synced US → {target_market.upper()}* (1 USD = {fx_rate} {target_currency}) — {len([r for r in results if r.startswith('✅')])} updated\n"
+        msg = header + "\n".join(results)
+        # Split long messages
+        if len(msg) > 3900:
+            msg = header + "\n".join(results[:50]) + f"\n_...and {len(results) - 50} more_"
+        requests.post(response_url, json={"response_type": "in_channel", "text": msg}, timeout=10)
+    except Exception as e:
+        log.error(f"Store sync failed: {e}", exc_info=True)
+        requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Sync failed: {e}"})
+
+
+@app.route("/slack/sync-store", methods=["POST"])
+def slack_sync_store():
+    response_url = request.form.get("response_url")
+    text = request.form.get("text", "").strip().lower()
+    if not text or text == "us":
+        return jsonify({"response_type": "ephemeral", "text": "Usage: `/cogs-sync uae` — sync US store prices, costs, and weights to target store"})
+    stores = get_stores()
+    if text not in stores:
+        available = ", ".join(k for k in stores.keys() if k != "us")
+        return jsonify({"response_type": "ephemeral", "text": f"❌ Unknown market `{text}`. Available: {available}"})
+    thread = threading.Thread(target=run_sync_store, args=(response_url, text), daemon=True)
+    thread.start()
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Syncing US → *{text.upper()}*... This may take a while."})
 
 
 @app.route("/slack/cogs-check", methods=["POST"])
