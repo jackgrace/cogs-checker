@@ -1081,24 +1081,103 @@ def run_update_price(response_url: str, sku_filter: str = None, market_filter: s
         requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Update failed: {e}"})
 
 
+def run_update_us_from_invoice(response_url: str, channel_id: str, sku_filter: str = None):
+    """Update US Shopify costs to match the most recent invoice upload for this channel."""
+    try:
+        cache = _last_invoice_check.get(channel_id)
+        if not cache:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": "❌ No invoice uploaded yet. Upload an invoice file (filename with 'INV') first."})
+            return
+        invoice_data = cache["invoice_data"]
+        stores = get_stores()
+        us_cfg = stores.get("us")
+        if not us_cfg:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": "❌ US store not configured."})
+            return
+        domain = us_cfg["domain"]
+        token = us_cfg["token"]
+        # Fetch current US variants and their costs
+        variants = fetch_all_products(domain, token)
+        item_ids = [v["inventory_item_id"] for v in variants if v["inventory_item_id"]]
+        costs = fetch_inventory_costs(domain, token, item_ids)
+        # Determine which invoice SKUs to apply
+        if sku_filter:
+            norm_filter = normalize_sku(sku_filter)
+            if norm_filter not in invoice_data:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ SKU `{sku_filter}` not found in latest invoice ({cache['filename']})."})
+                return
+            target_norm_skus = {norm_filter}
+        else:
+            target_norm_skus = cache.get("mismatch_norm_skus", set())
+            if not target_norm_skus:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"✅ No mismatches in latest invoice ({cache['filename']}) — nothing to update."})
+                return
+        results = []
+        updated_ids = set()
+        skipped_no_variant = []
+        for v in variants:
+            norm = normalize_sku(v["sku"])
+            if norm not in target_norm_skus:
+                continue
+            inv_id = v["inventory_item_id"]
+            if inv_id in updated_ids or not inv_id:
+                continue
+            invoice_entry = invoice_data.get(norm)
+            if not invoice_entry:
+                continue
+            target_cost = invoice_entry["unit_price"]
+            if target_cost <= 0:
+                continue
+            current_cost = costs.get(inv_id)
+            if current_cost is None:
+                skipped_no_variant.append(f"{v['sku']} (inv_id={inv_id})")
+                continue
+            diff = round(current_cost - target_cost, 2)
+            pct_diff = round((diff / target_cost) * 100, 1) if target_cost else 0
+            if abs(diff) <= TOLERANCE_USD or abs(pct_diff) <= TOLERANCE_PCT:
+                continue
+            log.info(f"[US] Update from invoice: {v['sku']} (inv_id={inv_id}): ${current_cost:.4f} → ${target_cost:.4f} (was {pct_diff:+.1f}%)")
+            try:
+                shopify_put(domain, token, f"inventory_items/{inv_id}", {"inventory_item": {"id": inv_id, "cost": str(target_cost)}})
+                results.append(f"✅ *US* `{v['sku']}` ${current_cost:.2f} → ${target_cost:.2f} (was {pct_diff:+.1f}%)")
+                updated_ids.add(inv_id)
+            except Exception as e:
+                log.error(f"[US] Update failed for {v['sku']} (inv_id={inv_id}): {e}")
+                results.append(f"❌ *US* `{v['sku']}` failed: {e}")
+        if not results:
+            requests.post(response_url, json={"response_type": "ephemeral", "text": "✅ No US updates needed — all costs within tolerance of invoice prices."})
+            return
+        header = f"*Updated US Shopify from invoice `{cache['filename']}`* ({len(results)} changes)\n"
+        msg = header + "\n".join(results)
+        if skipped_no_variant:
+            msg += f"\n\n_Note: {len(skipped_no_variant)} variants had inaccessible inventory items_"
+        requests.post(response_url, json={"response_type": "in_channel", "text": msg})
+    except Exception as e:
+        log.error(f"US update from invoice failed: {e}", exc_info=True)
+        requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Update failed: {e}"})
+
+
 @app.route("/slack/update-price", methods=["POST"])
 def slack_update_price():
     response_url = request.form.get("response_url")
+    channel_id = request.form.get("channel_id", "")
     text = request.form.get("text", "").strip()
     parts = text.split()
     stores = get_stores()
     markets = set(stores.keys())
     if len(parts) == 0:
-        return jsonify({"response_type": "ephemeral", "text": "Usage:\n`/cogs-update SKU` — update SKU in all stores\n`/cogs-update SKU au` — update SKU in AU only\n`/cogs-update au` — update all SKUs in AU"})
+        return jsonify({"response_type": "ephemeral", "text": "Usage:\n`/cogs-update SKU` — update SKU in all stores (except US)\n`/cogs-update SKU au` — update SKU in AU only\n`/cogs-update au` — update all SKUs in AU\n`/cogs-update us` — update US Shopify costs from last uploaded invoice\n`/cogs-update SKU us` — update specific SKU in US from invoice"})
     if len(parts) == 1:
         arg = parts[0].lower()
+        if arg == "us":
+            thread = threading.Thread(target=run_update_us_from_invoice, args=(response_url, channel_id, None), daemon=True)
+            thread.start()
+            return jsonify({"response_type": "ephemeral", "text": "⏳ Updating US Shopify costs from latest invoice..."})
         if arg in markets:
-            # geo only — update all SKUs for that store
             thread = threading.Thread(target=run_update_price, args=(response_url, None, arg), daemon=True)
             thread.start()
             return jsonify({"response_type": "ephemeral", "text": f"⏳ Updating all SKU costs in *{arg.upper()}*... This may take a while."})
         else:
-            # SKU only — update across all stores
             sku = parts[0].upper()
             thread = threading.Thread(target=run_update_price, args=(response_url, sku, None), daemon=True)
             thread.start()
@@ -1106,13 +1185,17 @@ def slack_update_price():
     if len(parts) == 2:
         sku = parts[0].upper()
         market = parts[1].lower()
+        if market == "us":
+            thread = threading.Thread(target=run_update_us_from_invoice, args=(response_url, channel_id, sku), daemon=True)
+            thread.start()
+            return jsonify({"response_type": "ephemeral", "text": f"⏳ Updating `{sku}` in US Shopify from latest invoice..."})
         if market not in markets:
             available = ", ".join(markets)
             return jsonify({"response_type": "ephemeral", "text": f"❌ Unknown market `{market}`. Available: {available}"})
         thread = threading.Thread(target=run_update_price, args=(response_url, sku, market), daemon=True)
         thread.start()
         return jsonify({"response_type": "ephemeral", "text": f"⏳ Updating `{sku}` cost in *{market.upper()}*..."})
-    return jsonify({"response_type": "ephemeral", "text": "Usage:\n`/cogs-update SKU` — update SKU in all stores\n`/cogs-update SKU au` — update SKU in AU only\n`/cogs-update au` — update all SKUs in AU"})
+    return jsonify({"response_type": "ephemeral", "text": "Usage:\n`/cogs-update SKU` — update SKU in all stores\n`/cogs-update SKU au` — update SKU in AU only\n`/cogs-update au` — update all SKUs in AU\n`/cogs-update us` — update US Shopify costs from last uploaded invoice"})
 
 
 import re
@@ -1535,6 +1618,9 @@ def slack_events():
     return jsonify({"ok": True})
 
 
+_last_invoice_check = {}
+
+
 def run_invoice_vs_shopify_check(channel: str, file_url: str, filename: str):
     """Compare invoice unit prices against current US Shopify costs."""
     try:
@@ -1633,6 +1719,15 @@ def run_invoice_vs_shopify_check(channel: str, file_url: str, filename: str):
         total_diff = round(total_invoice_value - total_shopify_value, 2)
         blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Total value at invoice qty:*\n• At invoice prices: *${total_invoice_value:,.2f}*\n• At Shopify costs: *${total_shopify_value:,.2f}*\n• Difference: *${total_diff:+,.2f}*"}})
         blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"✅ {len(matches)} matches  |  ⚠️ {len(mismatches)} mismatches  |  📄 {len(not_in_shopify)} not in Shopify"}]})
+        # Cache invoice data for /cogs-update us
+        _last_invoice_check[channel] = {
+            "filename": filename,
+            "timestamp": datetime.utcnow(),
+            "invoice_data": invoice_data,
+            "mismatch_norm_skus": {normalize_sku(m["sku"]) for m in mismatches},
+        }
+        if mismatches:
+            blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"💡 Run `/cogs-update us` to update US Shopify costs to invoice prices for the {len(mismatches)} mismatched SKUs"}]})
         slack_api("chat.postMessage", channel=channel, blocks=blocks, text="Invoice vs Shopify Cost Check")
     except Exception as e:
         log.error(f"Invoice vs Shopify check failed: {e}", exc_info=True)
