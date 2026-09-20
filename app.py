@@ -1250,7 +1250,8 @@ def parse_packing_list(wb) -> dict:
 
 
 def parse_invoice(wb) -> dict:
-    """Parse invoice Excel. Returns {normalized_sku: {qty, unit_price, line_total, name}}."""
+    """Parse invoice Excel. Returns {normalized_sku: {qty, unit_price, line_total, name}}.
+    Only uses the first sheet with valid header structure to avoid summary sheet contamination."""
     items = {}
     for sheet in wb.sheetnames:
         ws = wb[sheet]
@@ -1274,11 +1275,13 @@ def parse_invoice(wb) -> dict:
                     name_col = j
                 if val == "ITEM COST (USD)" or (val.startswith("ITEM COST") and "USD" in val):
                     cost_col = j
-            if sku_col is not None and qty_col is not None:
+            if sku_col is not None and qty_col is not None and price_col is not None:
                 header_row = i
                 break
         if header_row is None:
+            log.info(f"Sheet '{sheet}': no valid header row found, skipping")
             continue
+        log.info(f"Sheet '{sheet}': parsing from row {header_row+1} (sku_col={sku_col}, qty_col={qty_col}, price_col={price_col}, cost_col={cost_col})")
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
             cells = list(row)
             if sku_col >= len(cells):
@@ -1288,12 +1291,10 @@ def parse_invoice(wb) -> dict:
                 continue
             sku_str = str(sku_raw).strip()
             if not sku_str or not re.match(r'^[A-Za-z]', sku_str):
-                # Check if this is a non-product row
                 row_text = " ".join(str(c) for c in cells if c)
                 if is_non_product_row(row_text):
                     continue
                 continue
-            # Skip non-product rows even if they have a SKU-like value
             row_text = " ".join(str(c) for c in cells if c)
             if is_non_product_row(row_text):
                 continue
@@ -1321,13 +1322,21 @@ def parse_invoice(wb) -> dict:
             name = ""
             if name_col is not None and name_col < len(cells) and cells[name_col] is not None:
                 name = str(cells[name_col]).strip()
+            if norm in items:
+                log.warning(f"Sheet '{sheet}': duplicate SKU {sku_str} — existing qty={items[norm]['qty']} price={items[norm]['unit_price']}, new qty={qty} price={unit_price} (keeping first)")
+                continue
             items[norm] = {
                 "sku_raw": sku_str,
                 "name": name,
                 "qty": qty,
                 "unit_price": unit_price,
                 "line_total": line_total,
+                "source_sheet": sheet,
             }
+        # Only use the first sheet with a valid header — stop iterating
+        if items:
+            log.info(f"Parsed {len(items)} items from sheet '{sheet}', skipping remaining sheets")
+            break
     return items
 
 
