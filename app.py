@@ -1526,6 +1526,110 @@ def slack_events():
     return jsonify({"ok": True})
 
 
+def run_invoice_vs_shopify_check(channel: str, file_url: str, filename: str):
+    """Compare invoice unit prices against current US Shopify costs."""
+    try:
+        from openpyxl import load_workbook
+        log.info(f"Downloading invoice for Shopify comparison: {filename}...")
+        content = download_slack_file(file_url)
+        wb = load_workbook(io.BytesIO(content), data_only=True)
+        invoice_data = parse_invoice(wb)
+        log.info(f"Parsed invoice: {len(invoice_data)} SKUs")
+        if not invoice_data:
+            slack_api("chat.postMessage", channel=channel, text="❌ Could not parse any SKUs from the invoice.")
+            return
+        us_costs = fetch_us_store_costs()
+        if not us_costs:
+            slack_api("chat.postMessage", channel=channel, text="❌ Could not fetch US store costs.")
+            return
+        matches = []
+        mismatches = []
+        not_in_shopify = []
+        total_invoice_value = 0.0
+        total_shopify_value = 0.0
+        for norm_sku, inv in invoice_data.items():
+            invoice_price = inv["unit_price"]
+            qty = inv.get("qty", 0)
+            if invoice_price == 0:
+                continue
+            shopify_cost = us_costs.get(norm_sku)
+            if shopify_cost is None:
+                not_in_shopify.append({
+                    "sku": inv["sku_raw"],
+                    "invoice_price": invoice_price,
+                    "qty": qty,
+                })
+                continue
+            diff = round(invoice_price - shopify_cost, 2)
+            pct_diff = round((diff / shopify_cost) * 100, 1) if shopify_cost else 0
+            total_invoice_value += invoice_price * qty
+            total_shopify_value += shopify_cost * qty
+            entry = {
+                "sku": inv["sku_raw"],
+                "name": inv.get("name", ""),
+                "qty": qty,
+                "invoice_price": invoice_price,
+                "shopify_cost": shopify_cost,
+                "diff": diff,
+                "diff_pct": pct_diff,
+                "line_impact": round(diff * qty, 2),
+            }
+            if abs(diff) <= TOLERANCE_USD or abs(pct_diff) <= TOLERANCE_PCT:
+                matches.append(entry)
+            else:
+                mismatches.append(entry)
+        mismatches.sort(key=lambda x: abs(x["line_impact"]), reverse=True)
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": "📄 Invoice vs Shopify Cost Check", "emoji": True}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Invoice:* {filename}  |  *Compared:* {len(invoice_data)} SKUs  |  *Tolerance:* ${TOLERANCE_USD} / {TOLERANCE_PCT}%"}]},
+            {"type": "divider"},
+        ]
+        if mismatches:
+            overcharges = [m for m in mismatches if m["diff"] > 0]
+            undercharges = [m for m in mismatches if m["diff"] < 0]
+            over_impact = sum(m["line_impact"] for m in overcharges)
+            under_impact = sum(m["line_impact"] for m in undercharges)
+            lines = [f"⚠️ *Mismatches ({len(mismatches)}):*"]
+            for m in mismatches:
+                direction = "📈" if m["diff"] > 0 else "📉"
+                lines.append(f"{direction} `{m['sku']}` — Invoice: *${m['invoice_price']:.2f}* vs Shopify: *${m['shopify_cost']:.2f}* ({m['diff_pct']:+.1f}%) — qty {m['qty']} = ${m['line_impact']:+.2f}")
+            chunk = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 2900:
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+            summary_lines = []
+            if overcharges:
+                summary_lines.append(f"📈 *Invoice higher than Shopify cost:* ${over_impact:+,.2f} across {len(overcharges)} SKUs (supplier may have raised prices)")
+            if undercharges:
+                summary_lines.append(f"📉 *Invoice lower than Shopify cost:* ${under_impact:+,.2f} across {len(undercharges)} SKUs (Shopify cost may be stale)")
+            if summary_lines:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(summary_lines)}})
+        else:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "✅ *All invoice prices match Shopify costs within tolerance*"}})
+        if not_in_shopify:
+            lines = [f"📄 *On invoice but not in US Shopify ({len(not_in_shopify)}):*"]
+            for x in not_in_shopify[:30]:
+                lines.append(f"• `{x['sku']}` — ${x['invoice_price']:.2f} (qty {x['qty']})")
+            if len(not_in_shopify) > 30:
+                lines.append(f"_...and {len(not_in_shopify) - 30} more_")
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(lines)}})
+        blocks.append({"type": "divider"})
+        total_diff = round(total_invoice_value - total_shopify_value, 2)
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Total value at invoice qty:*\n• At invoice prices: *${total_invoice_value:,.2f}*\n• At Shopify costs: *${total_shopify_value:,.2f}*\n• Difference: *${total_diff:+,.2f}*"}})
+        blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"✅ {len(matches)} matches  |  ⚠️ {len(mismatches)} mismatches  |  📄 {len(not_in_shopify)} not in Shopify"}]})
+        slack_api("chat.postMessage", channel=channel, blocks=blocks, text="Invoice vs Shopify Cost Check")
+    except Exception as e:
+        log.error(f"Invoice vs Shopify check failed: {e}", exc_info=True)
+        slack_api("chat.postMessage", channel=channel, text=f"❌ Invoice vs Shopify check failed: {e}")
+
+
 def process_pending_files(channel_id: str):
     with _pending_lock:
         pending = _pending_files.pop(channel_id, None)
@@ -1533,8 +1637,17 @@ def process_pending_files(channel_id: str):
         return
     files = pending["files"]
     log.info(f"Processing {len(files)} files for channel {channel_id}")
+    # Single invoice file → compare against US Shopify costs
+    if len(files) == 1:
+        url, filename = files[0]
+        if classify_file(filename) == "invoice":
+            run_invoice_vs_shopify_check(channel_id, url, filename)
+            return
+        else:
+            slack_api("chat.postMessage", channel=channel_id, text=f"⚠️ Single file uploaded but not identified as invoice (filename should contain 'INV').")
+            return
     if len(files) < 3:
-        slack_api("chat.postMessage", channel=channel_id, text=f"⚠️ Received {len(files)} file(s) but need 3 (2 packing lists + 1 invoice).")
+        slack_api("chat.postMessage", channel=channel_id, text=f"⚠️ Received {len(files)} file(s). Upload 1 invoice for cost check, or 3 files (2 packing lists + 1 invoice) for full shipment verification.")
         return
     run_invoice_check(channel_id, files)
 
