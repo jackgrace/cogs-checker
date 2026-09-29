@@ -1760,6 +1760,174 @@ DAILY_CHECK_HOUR = int(os.environ.get("DAILY_CHECK_HOUR", "0"))
 DAILY_CHECK_TZ_OFFSET = int(os.environ.get("DAILY_CHECK_TZ_OFFSET", "10"))
 
 
+def fetch_orders_for_date(domain: str, token: str, date_str: str, tz_offset_hours: int = 10) -> list:
+    """Fetch all orders created on the given local date (YYYY-MM-DD).
+    Uses local timezone offset to convert to UTC bounds."""
+    from datetime import datetime as dt_cls
+    day = dt_cls.strptime(date_str, "%Y-%m-%d")
+    # Local midnight to next local midnight, converted to UTC
+    start_utc = day - timedelta(hours=tz_offset_hours)
+    end_utc = day + timedelta(days=1) - timedelta(hours=tz_offset_hours)
+    created_at_min = start_utc.strftime("%Y-%m-%dT%H:%M:%S-00:00")
+    created_at_max = end_utc.strftime("%Y-%m-%dT%H:%M:%S-00:00")
+    orders = []
+    params = {
+        "limit": 250,
+        "status": "any",
+        "financial_status": "paid,partially_paid,partially_refunded",
+        "created_at_min": created_at_min,
+        "created_at_max": created_at_max,
+        "fields": "id,name,created_at,line_items,financial_status,total_price,currency",
+    }
+    endpoint = f"https://{domain}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
+    headers = {"X-Shopify-Access-Token": token}
+    url = endpoint
+    while url:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        orders.extend(data.get("orders", []))
+        params = {}
+        link = resp.headers.get("Link", "")
+        url = None
+        if 'rel="next"' in link:
+            for part in link.split(","):
+                if 'rel="next"' in part:
+                    url = part.split("<")[1].split(">")[0]
+                    break
+    return orders
+
+
+def aggregate_sales_by_sku(orders: list) -> dict:
+    """Aggregate line item quantities by normalized SKU.
+    Returns {normalized_sku: {sku_raw, qty, orders, revenue}}."""
+    totals = {}
+    for order in orders:
+        for li in order.get("line_items", []):
+            sku = li.get("sku", "")
+            if not sku:
+                continue
+            qty = li.get("quantity", 0) or 0
+            price = float(li.get("price", 0) or 0)
+            norm = normalize_sku(sku)
+            if norm not in totals:
+                totals[norm] = {"sku_raw": sku, "qty": 0, "orders": set(), "revenue": 0.0, "product_title": li.get("title", "")}
+            totals[norm]["qty"] += qty
+            totals[norm]["orders"].add(order["id"])
+            totals[norm]["revenue"] += price * qty
+    for norm in totals:
+        totals[norm]["orders"] = len(totals[norm]["orders"])
+    return totals
+
+
+def run_sales_report(response_url: str = None, channel_id: str = None, market_filter: str = None, date_str: str = None):
+    try:
+        if not date_str:
+            # Default: yesterday in local timezone
+            local_now = datetime.utcnow() + timedelta(hours=DAILY_CHECK_TZ_OFFSET)
+            yesterday = local_now - timedelta(days=1)
+            date_str = yesterday.strftime("%Y-%m-%d")
+        stores = get_stores()
+        if not stores:
+            msg = "❌ No Shopify stores configured."
+            if response_url:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": msg})
+            return
+        per_store = {}
+        combined = {}
+        total_orders = 0
+        for market, cfg in stores.items():
+            if market_filter and market != market_filter.lower():
+                continue
+            try:
+                log.info(f"[{market.upper()}] Fetching orders for {date_str}...")
+                orders = fetch_orders_for_date(cfg["domain"], cfg["token"], date_str, DAILY_CHECK_TZ_OFFSET)
+                log.info(f"[{market.upper()}] Found {len(orders)} orders")
+                totals = aggregate_sales_by_sku(orders)
+                per_store[market] = {"orders_count": len(orders), "sku_totals": totals, "currency": cfg["currency"]}
+                total_orders += len(orders)
+                for norm, entry in totals.items():
+                    if norm not in combined:
+                        combined[norm] = {"sku_raw": entry["sku_raw"], "qty": 0, "product_title": entry["product_title"], "by_store": {}}
+                    combined[norm]["qty"] += entry["qty"]
+                    combined[norm]["by_store"][market] = entry["qty"]
+            except Exception as e:
+                log.error(f"[{market.upper()}] Sales fetch failed: {e}")
+                per_store[market] = {"error": str(e)}
+        # Build Slack message
+        blocks = [
+            {"type": "header", "text": {"type": "plain_text", "text": f"📊 Sales Report — {date_str}", "emoji": True}},
+            {"type": "context", "elements": [{"type": "mrkdwn", "text": f"*Date:* {date_str} (local TZ +{DAILY_CHECK_TZ_OFFSET}h)  |  *Orders:* {total_orders}  |  *Unique SKUs:* {len(combined)}"}]},
+            {"type": "divider"},
+        ]
+        # Per-store summary
+        store_lines = []
+        for market, data in per_store.items():
+            if "error" in data:
+                store_lines.append(f"❌ *{market.upper()}*: {data['error']}")
+            else:
+                store_lines.append(f"*{market.upper()}*: {data['orders_count']} orders, {len(data['sku_totals'])} SKUs sold")
+        if store_lines:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(store_lines)}})
+            blocks.append({"type": "divider"})
+        # SKU aggregate table (sorted by total qty descending)
+        sorted_skus = sorted(combined.items(), key=lambda x: x[1]["qty"], reverse=True)
+        if sorted_skus:
+            markets_list = sorted([m for m in per_store.keys() if "error" not in per_store[m]])
+            header_line = f"*SKU sales by store (sorted by total qty):*\n`SKU` — total | " + " | ".join(m.upper() for m in markets_list)
+            lines = [header_line]
+            for norm, entry in sorted_skus:
+                per_market = " | ".join(str(entry["by_store"].get(m, 0)) for m in markets_list)
+                lines.append(f"`{entry['sku_raw']}` — *{entry['qty']}* | {per_market}")
+            chunk = []
+            chunk_len = 0
+            for line in lines:
+                if chunk_len + len(line) + 1 > 2900:
+                    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+                    chunk = []
+                    chunk_len = 0
+                chunk.append(line)
+                chunk_len += len(line) + 1
+            if chunk:
+                blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "\n".join(chunk)}})
+        else:
+            blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "_No sales for this date._"}})
+        message = {"blocks": blocks, "response_type": "in_channel"}
+        if response_url:
+            requests.post(response_url, json=message, timeout=10)
+        elif channel_id and SLACK_BOT_TOKEN:
+            slack_api("chat.postMessage", channel=channel_id, blocks=blocks, text=f"Sales Report {date_str}")
+    except Exception as e:
+        log.error(f"Sales report failed: {e}", exc_info=True)
+        if response_url:
+            try:
+                requests.post(response_url, json={"response_type": "ephemeral", "text": f"❌ Sales report failed: {e}"})
+            except Exception:
+                pass
+
+
+@app.route("/slack/sales", methods=["POST"])
+def slack_sales():
+    response_url = request.form.get("response_url")
+    text = request.form.get("text", "").strip().lower()
+    parts = text.split()
+    stores = get_stores()
+    market_filter = "us"  # default to US only
+    date_str = None
+    for p in parts:
+        if p == "all":
+            market_filter = None
+        elif p in stores:
+            market_filter = p
+        elif re.match(r'^\d{4}-\d{2}-\d{2}$', p):
+            date_str = p
+    thread = threading.Thread(target=run_sales_report, args=(response_url, None, market_filter, date_str), daemon=True)
+    thread.start()
+    scope = f"*{market_filter.upper()}*" if market_filter else "*all stores*"
+    label = f" for {date_str}" if date_str else " (yesterday)"
+    return jsonify({"response_type": "ephemeral", "text": f"⏳ Fetching sales{label} for {scope}..."})
+
+
 def scheduled_daily_check():
     """Run daily COGS check at configured hour in configured timezone."""
     while True:
@@ -1778,6 +1946,11 @@ def scheduled_daily_check():
                 run_cogs_check(channel_id=SLACK_CHANNEL_ID)
             except Exception as e:
                 log.error(f"Scheduled COGS check failed: {e}")
+            log.info("Running scheduled daily US sales report...")
+            try:
+                run_sales_report(channel_id=SLACK_CHANNEL_ID, market_filter="us")
+            except Exception as e:
+                log.error(f"Scheduled sales report failed: {e}")
         else:
             log.warning("Skipping scheduled check: SLACK_CHANNEL_ID or SLACK_BOT_TOKEN not set")
 
