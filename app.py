@@ -1941,11 +1941,6 @@ def scheduled_daily_check():
         log.info(f"Next daily COGS check at {target} (local TZ offset +{DAILY_CHECK_TZ_OFFSET}h), waiting {wait_seconds/3600:.1f}h")
         time.sleep(wait_seconds)
         if SLACK_CHANNEL_ID and SLACK_BOT_TOKEN:
-            log.info("Running scheduled daily COGS check...")
-            try:
-                run_cogs_check(channel_id=SLACK_CHANNEL_ID)
-            except Exception as e:
-                log.error(f"Scheduled COGS check failed: {e}")
             log.info("Running scheduled daily US sales report...")
             try:
                 run_sales_report(channel_id=SLACK_CHANNEL_ID, market_filter="us")
